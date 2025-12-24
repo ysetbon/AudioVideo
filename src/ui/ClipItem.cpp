@@ -5,6 +5,7 @@
 #include <QPainter>
 #include <QCursor>
 #include <QGraphicsScene>
+#include <QFileInfo>
 #include <algorithm>
 
 namespace ClipTune {

@@ -3,6 +3,7 @@
 #include "core/Project.h"
 #include "core/Track.h"
 #include "core/Clip.h"
+#include "core/QtHashCompat.h"
 #include "FadeDSP.h"
 #include <vector>
 #include <unordered_map>

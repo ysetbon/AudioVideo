@@ -11,11 +11,20 @@
       "features": [
         "avcodec",
         "avformat",
-        "avutil",
         "swresample",
         "swscale"
       ]
-    }
+    },
+    {
+      "name": "qtbase",
+      "default-features": false,
+      "features": [
+        "concurrent",
+        "widgets",
+        "gui"
+      ]
+    },
+    "qtmultimedia"
   ],
-  "builtin-baseline": "2024.01.12"
+  "builtin-baseline": "5d57f5a0a5469a23e005fc79a7c1814ab4fc967e"
 }

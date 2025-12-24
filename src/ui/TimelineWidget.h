@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Project.h"
+#include "core/QtHashCompat.h"
 #include "ClipItem.h"
 #include "RulerWidget.h"
 #include "TrackHeaderWidget.h"

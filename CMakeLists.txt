@@ -18,27 +18,13 @@ find_package(Qt6 REQUIRED COMPONENTS
     Concurrent
 )
 
-# Find FFmpeg via pkg-config or vcpkg
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(AVFORMAT REQUIRED libavformat)
-    pkg_check_modules(AVCODEC REQUIRED libavcodec)
-    pkg_check_modules(AVUTIL REQUIRED libavutil)
-    pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
-    pkg_check_modules(SWSCALE REQUIRED libswscale)
-else()
-    # Manual FFmpeg finding for vcpkg
-    find_path(AVFORMAT_INCLUDE_DIRS libavformat/avformat.h)
-    find_library(AVFORMAT_LIBRARIES avformat)
-    find_path(AVCODEC_INCLUDE_DIRS libavcodec/avcodec.h)
-    find_library(AVCODEC_LIBRARIES avcodec)
-    find_path(AVUTIL_INCLUDE_DIRS libavutil/avutil.h)
-    find_library(AVUTIL_LIBRARIES avutil)
-    find_path(SWRESAMPLE_INCLUDE_DIRS libswresample/swresample.h)
-    find_library(SWRESAMPLE_LIBRARIES swresample)
-    find_path(SWSCALE_INCLUDE_DIRS libswscale/swscale.h)
-    find_library(SWSCALE_LIBRARIES swscale)
-endif()
+# Find FFmpeg via vcpkg
+find_package(FFMPEG REQUIRED)
+
+# Find swresample and swscale separately (not always included in FFMPEG_LIBRARIES)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SWRESAMPLE REQUIRED libswresample)
+pkg_check_modules(SWSCALE REQUIRED libswscale)
 
 # Collect all source files
 set(CORE_SOURCES
@@ -99,11 +85,12 @@ add_executable(ClipTune
 # Include directories
 target_include_directories(ClipTune PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${AVFORMAT_INCLUDE_DIRS}
-    ${AVCODEC_INCLUDE_DIRS}
-    ${AVUTIL_INCLUDE_DIRS}
-    ${SWRESAMPLE_INCLUDE_DIRS}
-    ${SWSCALE_INCLUDE_DIRS}
+    ${FFMPEG_INCLUDE_DIRS}
+)
+
+# Link directories (needed for vcpkg FFmpeg)
+target_link_directories(ClipTune PRIVATE
+    ${FFMPEG_LIBRARY_DIRS}
 )
 
 # Link libraries
@@ -111,9 +98,7 @@ target_link_libraries(ClipTune PRIVATE
     Qt6::Widgets
     Qt6::Multimedia
     Qt6::Concurrent
-    ${AVFORMAT_LIBRARIES}
-    ${AVCODEC_LIBRARIES}
-    ${AVUTIL_LIBRARIES}
+    ${FFMPEG_LIBRARIES}
     ${SWRESAMPLE_LIBRARIES}
     ${SWSCALE_LIBRARIES}
 )

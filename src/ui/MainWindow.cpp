@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "core/Commands.h"
+#include "media/Demuxer.h"
 #include <QMenuBar>
 #include <QToolBar>
 #include <QStatusBar>

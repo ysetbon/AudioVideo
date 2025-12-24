@@ -4,6 +4,7 @@
 #include "media/Scaler.h"
 #include <QFile>
 #include <QDataStream>
+#include <QCoreApplication>
 #include <cmath>
 
 namespace ClipTune {

@@ -250,7 +250,8 @@ bool Mp4Muxer::initAudioEncoder(const AudioEncoderSettings& settings)
 
     // Initialize resampler for float to encoder format
     AVChannelLayout srcLayout = AV_CHANNEL_LAYOUT_STEREO;
-    ret = swr_alloc_set_opts2(&m_audioResampler,
+    SwrContext* swrCtx = nullptr;
+    ret = swr_alloc_set_opts2(&swrCtx,
                                &m_audioCodecCtx->ch_layout,
                                m_audioCodecCtx->sample_fmt,
                                settings.sampleRate,
@@ -258,10 +259,8 @@ bool Mp4Muxer::initAudioEncoder(const AudioEncoderSettings& settings)
                                AV_SAMPLE_FMT_FLT,
                                settings.sampleRate,
                                0, nullptr);
-
-    SwrContext* swrPtr = m_audioResampler.release();
-    if (ret < 0 || !swrPtr) return false;
-    m_audioResampler.reset(swrPtr);
+    if (ret < 0 || !swrCtx) return false;
+    m_audioResampler.reset(swrCtx);
 
     ret = swr_init(m_audioResampler.get());
     if (ret < 0) return false;

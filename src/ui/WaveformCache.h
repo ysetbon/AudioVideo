@@ -9,15 +9,7 @@
 #include <memory>
 #include <mutex>
 
-// Hash specialization for QString to use in unordered containers
-namespace std {
-    template<>
-    struct hash<QString> {
-        size_t operator()(const QString& s) const noexcept {
-            return qHash(s);
-        }
-    };
-}
+// Note: Qt6 provides std::hash<QString> in qhashfunctions.h
 
 namespace ClipTune {
 
