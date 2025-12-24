@@ -38,6 +38,9 @@ public:
     void close();
     bool isOpen() const { return m_formatCtx != nullptr; }
 
+    // Get last error message (useful when open() returns false)
+    QString lastError() const { return m_lastError; }
+
     // Get media info
     const MediaInfo& info() const { return m_info; }
 
@@ -72,6 +75,7 @@ private:
     MediaInfo m_info;
     const AVCodec* m_audioCodec = nullptr;
     const AVCodec* m_videoCodec = nullptr;
+    QString m_lastError;
 };
 
 } // namespace ClipTune

@@ -1,4 +1,5 @@
 #include "Demuxer.h"
+#include <QFileInfo>
 #include <stdexcept>
 
 namespace ClipTune {
@@ -13,13 +14,36 @@ Demuxer::~Demuxer()
 bool Demuxer::open(const QString& filePath)
 {
     close();
+    m_lastError.clear();
+
+    // Check if file exists first
+    QFileInfo fileInfo(filePath);
+    if (!fileInfo.exists()) {
+        m_lastError = QString("File not found: %1").arg(filePath);
+        return false;
+    }
+
+    if (!fileInfo.isReadable()) {
+        m_lastError = QString("File not readable: %1").arg(filePath);
+        return false;
+    }
 
     try {
-        m_formatCtx = createInputFormatContext(filePath.toStdString());
+        // Use toUtf8() for proper Unicode handling across platforms
+        m_formatCtx = createInputFormatContext(filePath.toUtf8().constData());
         m_info.filePath = filePath;
         probeStreamInfo();
+
+        // Validate that we found at least one usable stream
+        if (!m_info.hasAudio && !m_info.hasVideo) {
+            m_lastError = QString("No audio or video streams found in: %1").arg(fileInfo.fileName());
+            close();
+            return false;
+        }
+
         return true;
     } catch (const std::exception& e) {
+        m_lastError = QString("Failed to open media: %1").arg(QString::fromUtf8(e.what()));
         close();
         return false;
     }

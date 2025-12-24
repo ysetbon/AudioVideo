@@ -258,15 +258,58 @@ void MainWindow::saveProjectAs()
 void MainWindow::importMedia()
 {
     QStringList fileNames = QFileDialog::getOpenFileNames(this, "Import Media",
-        QString(), "Media Files (*.mp4 *.mkv *.avi *.mov *.mp3 *.wav *.aac *.flac);;All Files (*)");
+        QString(), "Media Files (*.mp4 *.mkv *.avi *.mov *.mp3 *.wav *.aac *.flac *.ogg *.webm *.m4a *.wma *.wmv);;All Files (*)");
 
     if (fileNames.isEmpty()) return;
 
+    int successCount = 0;
+    QStringList failedFiles;
+
     for (const QString& fileName : fileNames) {
-        // Determine track type based on file extension
+        // First, probe the media file to ensure it's valid and get duration
+        Demuxer demuxer;
+        if (!demuxer.open(fileName)) {
+            QString errorDetail = demuxer.lastError();
+            if (errorDetail.isEmpty()) {
+                failedFiles.append(QFileInfo(fileName).fileName());
+            } else {
+                failedFiles.append(QString("%1 (%2)").arg(QFileInfo(fileName).fileName(), errorDetail));
+            }
+            continue;
+        }
+
+        const auto& mediaInfo = demuxer.info();
+
+        // Check if we have valid media streams
+        if (!mediaInfo.hasAudio && !mediaInfo.hasVideo) {
+            failedFiles.append(QFileInfo(fileName).fileName() + " (no media streams)");
+            continue;
+        }
+
+        // Check for valid duration
+        if (mediaInfo.duration <= 0.0) {
+            failedFiles.append(QFileInfo(fileName).fileName() + " (invalid duration)");
+            continue;
+        }
+
+        // Determine track type based on media content and file extension
         QString ext = QFileInfo(fileName).suffix().toLower();
-        TrackType type = (ext == "mp3" || ext == "wav" || ext == "aac" || ext == "flac")
-                         ? TrackType::Audio : TrackType::Video;
+        TrackType type;
+
+        // Audio-only files go to audio track
+        if (mediaInfo.hasAudio && !mediaInfo.hasVideo) {
+            type = TrackType::Audio;
+        }
+        // Video files (with or without audio) go to video track
+        else if (mediaInfo.hasVideo) {
+            type = TrackType::Video;
+        }
+        // Fallback to extension-based detection
+        else {
+            type = (ext == "mp3" || ext == "wav" || ext == "aac" || ext == "flac" ||
+                    ext == "ogg" || ext == "m4a" || ext == "wma")
+                   ? TrackType::Audio : TrackType::Video;
+        }
 
         // Find or create appropriate track
         auto tracks = (type == TrackType::Audio) ? m_project->audioTracks() : m_project->videoTracks();
@@ -283,20 +326,33 @@ void MainWindow::importMedia()
         auto clip = m_project->importMedia(fileName, track, startTime);
 
         if (clip) {
-            // Probe media to get duration
-            Demuxer demuxer;
-            if (demuxer.open(fileName)) {
-                clip->setMediaDuration(demuxer.info().duration);
-                clip->setOutPoint(demuxer.info().duration);
+            // Set the probed duration on the clip
+            clip->setMediaDuration(mediaInfo.duration);
+            clip->setOutPoint(mediaInfo.duration);
+
+            // Preload audio if the clip has audio
+            if (mediaInfo.hasAudio) {
+                m_audioEngine->mixer().preloadClip(*clip);
             }
 
-            // Preload audio
-            m_audioEngine->mixer().preloadClip(*clip);
+            ++successCount;
         }
     }
 
     m_timeline->refresh();
-    statusBar()->showMessage(QString("Imported %1 file(s)").arg(fileNames.size()), 3000);
+
+    // Show appropriate status message
+    if (failedFiles.isEmpty()) {
+        statusBar()->showMessage(QString("Imported %1 file(s)").arg(successCount), 3000);
+    } else if (successCount > 0) {
+        statusBar()->showMessage(QString("Imported %1 file(s), %2 failed").arg(successCount).arg(failedFiles.size()), 5000);
+        QMessageBox::warning(this, "Import Warning",
+            QString("Some files could not be imported:\n\n%1").arg(failedFiles.join("\n")));
+    } else {
+        statusBar()->showMessage("Import failed", 3000);
+        QMessageBox::critical(this, "Import Failed",
+            QString("Could not import any files:\n\n%1\n\nPlease ensure the files are valid media files.").arg(failedFiles.join("\n")));
+    }
 }
 
 void MainWindow::exportVideo()
