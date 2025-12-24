@@ -1,0 +1,21 @@
+{
+  "name": "cliptune",
+  "version": "0.1.0",
+  "description": "Audio/Video Editor - Simple Audacity + Video Clips on Timeline",
+  "homepage": "https://github.com/ysetbon/AudioVideo",
+  "license": "MIT",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": true,
+      "features": [
+        "avcodec",
+        "avformat",
+        "avutil",
+        "swresample",
+        "swscale"
+      ]
+    }
+  ],
+  "builtin-baseline": "2024.01.12"
+}
