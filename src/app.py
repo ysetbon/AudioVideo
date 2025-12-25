@@ -312,7 +312,8 @@ class AudioEngine:
 
     DEFAULT_SAMPLE_RATE = 48000
     DEFAULT_CHANNELS = 2
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE = 0  # Let PortAudio choose; requested via latency='low'
+    LATENCY_MODE = 'low'
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -324,6 +325,7 @@ class AudioEngine:
         self.is_playing = False
         self.playback_position = 0.0  # in seconds
         self._playback_sample = 0  # current sample position
+        self._ui_floor_time = 0.0  # for latency-compensated UI playhead
 
         # Active clips for playback
         self._active_clips = []  # list of (LoadedAudio, clip_start_time, clip_duration)
@@ -336,6 +338,51 @@ class AudioEngine:
 
         # Loading state
         self._loading_files: set = set()
+
+    def _ensure_stream(self) -> bool:
+        if not SOUNDDEVICE_AVAILABLE:
+            return False
+
+        if self._stream is not None:
+            try:
+                if not self._stream.active:
+                    self._stream.start()
+                return True
+            except Exception:
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+
+        try:
+            self._stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype=np.float32,
+                blocksize=self.BLOCK_SIZE,
+                latency=self.LATENCY_MODE,
+                callback=self._audio_callback,
+                prime_output_buffers_using_stream_callback=True,
+            )
+            self._stream.start()
+            return True
+        except Exception as e:
+            print(f"Error starting audio stream: {e}")
+            self._stream = None
+            return False
+
+    def get_output_latency(self) -> float:
+        stream = self._stream
+        if not stream:
+            return 0.0
+        latency = getattr(stream, 'latency', 0.0)
+        try:
+            if isinstance(latency, (tuple, list)):
+                latency = latency[-1] if latency else 0.0
+            return max(0.0, float(latency))
+        except Exception:
+            return 0.0
 
     def load_audio(self, filepath: str, callback: Optional[Callable] = None) -> Optional[LoadedAudio]:
         """Load an audio file into memory using FFmpeg. Can be async with callback."""
@@ -412,19 +459,70 @@ class AudioEngine:
         if filepath in self.loaded_audio:
             del self.loaded_audio[filepath]
 
+    @staticmethod
+    def _apply_fade_curve(t: np.ndarray, curve: float) -> np.ndarray:
+        """Apply curve to a 0..1 ramp. 0 is linear, positive/negative adjusts curvature."""
+        try:
+            curve = float(curve)
+        except Exception:
+            curve = 0.0
+
+        if abs(curve) < 1e-6:
+            return t
+
+        t = t.astype(np.float32, copy=False)
+        one = np.float32(1.0)
+        power = np.float32(1.0 + min(8.0, abs(curve)))
+        if curve > 0:
+            return np.power(t, power)
+        return one - np.power(one - t, power)
+
     def set_clips(self, clips: list):
         """Set the clips to play. Each clip should have 'path', 'start', 'duration'."""
         with self._lock:
             self._active_clips = []
             for clip in clips:
                 filepath = clip.get('path')
-                if filepath and filepath in self.loaded_audio:
-                    self._active_clips.append({
-                        'audio': self.loaded_audio[filepath],
-                        'start': clip.get('start', 0),
-                        'duration': clip.get('duration', 0),
-                        'source_start': clip.get('source_start', 0.0),
-                    })
+                if not filepath or filepath not in self.loaded_audio:
+                    continue
+
+                try:
+                    start = float(clip.get('start', 0.0))
+                    duration = float(clip.get('duration', 0.0))
+                    source_start = float(clip.get('source_start', 0.0))
+                    fade_in = float(clip.get('fade_in', 0.0))
+                    fade_out = float(clip.get('fade_out', 0.0))
+                    fade_in_curve = float(clip.get('fade_in_curve', 0.0))
+                    fade_out_curve = float(clip.get('fade_out_curve', 0.0))
+                except Exception:
+                    continue
+
+                if duration <= 0:
+                    continue
+
+                start_frame = int(round(start * self.sample_rate))
+                duration_frames = int(round(duration * self.sample_rate))
+                if duration_frames <= 0:
+                    continue
+
+                fade_in = max(0.0, min(fade_in, duration))
+                fade_out = max(0.0, min(fade_out, duration))
+
+                self._active_clips.append({
+                    'audio': self.loaded_audio[filepath],
+                    'start': start,
+                    'duration': duration,
+                    'source_start': source_start,
+                    'fade_in': fade_in,
+                    'fade_out': fade_out,
+                    'fade_in_curve': fade_in_curve,
+                    'fade_out_curve': fade_out_curve,
+                    'start_frame': start_frame,
+                    'duration_frames': duration_frames,
+                    'source_start_frame': int(round(source_start * self.sample_rate)),
+                    'fade_in_frames': int(round(fade_in * self.sample_rate)),
+                    'fade_out_frames': int(round(fade_out * self.sample_rate)),
+                })
 
     def _audio_callback(self, outdata, frames, time_info, status):
         """Sounddevice callback - fills output buffer with mixed audio."""
@@ -436,24 +534,47 @@ class AudioEngine:
                 outdata.fill(0)
                 return
 
-            # Current playback time
-            current_time = self._playback_sample / self.sample_rate
-
             # Mix all active clips
             mixed = np.zeros((frames, self.channels), dtype=np.float32)
 
-            for clip in self._active_clips:
-                audio: LoadedAudio = clip['audio']
-                clip_start = clip['start']
-                clip_duration = clip['duration']
-                source_start = clip.get('source_start', 0.0)
+            block_start = int(self._playback_sample)
+            block_end = block_start + int(frames)
 
-                # Check if this clip is active at current time
-                if current_time >= clip_start and current_time < clip_start + clip_duration:
-                    # Time within the clip
-                    clip_time = (current_time - clip_start) + float(source_start)
-                    samples = audio.get_samples_at(clip_time, frames)
-                    mixed += samples
+            for clip in self._active_clips:
+                clip_start = int(clip['start_frame'])
+                clip_end = clip_start + int(clip['duration_frames'])
+
+                overlap_start = max(block_start, clip_start)
+                overlap_end = min(block_end, clip_end)
+                if overlap_end <= overlap_start:
+                    continue
+
+                out_offset = overlap_start - block_start
+                frames_to_mix = overlap_end - overlap_start
+
+                clip_offset = overlap_start - clip_start
+                src_frame = int(clip['source_start_frame']) + clip_offset
+
+                samples = clip['audio'].get_samples_by_frame(src_frame, frames_to_mix)
+
+                fade_in_frames = int(clip.get('fade_in_frames', 0) or 0)
+                fade_out_frames = int(clip.get('fade_out_frames', 0) or 0)
+                duration_frames = int(clip.get('duration_frames', 0) or 0)
+                if duration_frames > 0 and (fade_in_frames > 0 or fade_out_frames > 0):
+                    positions = clip_offset + np.arange(frames_to_mix, dtype=np.float32)
+                    gains = np.ones(frames_to_mix, dtype=np.float32)
+
+                    if fade_in_frames > 0:
+                        t_in = np.clip(positions / fade_in_frames, 0.0, 1.0)
+                        gains = np.minimum(gains, self._apply_fade_curve(t_in, clip.get('fade_in_curve', 0.0)))
+                    if fade_out_frames > 0:
+                        remaining = float(duration_frames) - positions
+                        t_out = np.clip(remaining / fade_out_frames, 0.0, 1.0)
+                        gains = np.minimum(gains, self._apply_fade_curve(t_out, clip.get('fade_out_curve', 0.0)))
+
+                    samples = samples * gains[:, None]
+
+                mixed[out_offset:out_offset + frames_to_mix] += samples
 
             # Clip to prevent distortion
             np.clip(mixed, -1.0, 1.0, out=mixed)
@@ -469,38 +590,20 @@ class AudioEngine:
             print("sounddevice not available")
             return
 
-        self.stop()
-
         with self._lock:
-            self.playback_position = start_time
-            self._playback_sample = int(start_time * self.sample_rate)
+            self.playback_position = max(0.0, float(start_time))
+            self._playback_sample = int(round(self.playback_position * self.sample_rate))
+            self._ui_floor_time = self.playback_position
             self.is_playing = True
 
-        try:
-            self._stream = sd.OutputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                dtype=np.float32,
-                blocksize=self.BLOCK_SIZE,
-                callback=self._audio_callback
-            )
-            self._stream.start()
-        except Exception as e:
-            print(f"Error starting audio stream: {e}")
-            self.is_playing = False
+        if not self._ensure_stream():
+            with self._lock:
+                self.is_playing = False
 
     def pause(self):
         """Pause playback (keeps position)."""
         with self._lock:
             self.is_playing = False
-
-        if self._stream:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
 
     def stop(self):
         """Stop playback and reset position."""
@@ -508,12 +611,14 @@ class AudioEngine:
         with self._lock:
             self.playback_position = 0
             self._playback_sample = 0
+            self._ui_floor_time = 0.0
 
     def seek(self, time: float):
         """Seek to a specific time."""
         with self._lock:
-            self.playback_position = max(0, time)
-            self._playback_sample = int(self.playback_position * self.sample_rate)
+            self.playback_position = max(0.0, float(time))
+            self._playback_sample = int(round(self.playback_position * self.sample_rate))
+            self._ui_floor_time = self.playback_position
 
     def is_active(self) -> bool:
         """Check if currently playing."""
@@ -523,9 +628,27 @@ class AudioEngine:
         """Get current playback position in seconds."""
         return self.playback_position
 
+    def get_position_for_ui(self) -> float:
+        """Playback position aligned to what you hear (accounts for output latency)."""
+        with self._lock:
+            position = float(self.playback_position)
+            floor_time = float(self._ui_floor_time)
+
+        compensated = position - self.get_output_latency()
+        if compensated < floor_time:
+            return floor_time
+        return compensated
+
     def cleanup(self):
         """Clean up resources."""
         self.stop()
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
         self.loaded_audio.clear()
 
     def get_waveform(self, filepath: str, width: int) -> Optional[list]:
@@ -561,6 +684,11 @@ class TimelineCanvas(tk.Canvas):
         self.on_clip_select: Optional[Callable] = None
         self.on_timeline_edited: Optional[Callable[[], None]] = None
 
+        # Playhead rendering (avoid full redraw on scrubbing)
+        self._playhead_line_id: Optional[int] = None
+        self._playhead_handle_id: Optional[int] = None
+        self._drag_playhead = False
+
         # Track configuration
         self.track_height = 80
         self.header_width = 150
@@ -584,6 +712,8 @@ class TimelineCanvas(tk.Canvas):
 
         self._clip_edge_px = 8
         self._min_clip_duration = 0.05  # seconds
+        self._fade_handle_radius = 5
+        self._fade_handle_y_offset = 14
 
         # Create default tracks
         self._create_default_tracks()
@@ -605,6 +735,8 @@ class TimelineCanvas(tk.Canvas):
         ]
 
     def _on_click(self, event):
+        self._drag_playhead = False
+
         # Check if click is on an add button
         for track_idx, (x1, y1, x2, y2) in self._add_buttons.items():
             if x1 <= event.x <= x2 and y1 <= event.y <= y2:
@@ -648,12 +780,24 @@ class TimelineCanvas(tk.Canvas):
                 media_duration = self.audio_engine.loaded_audio[hit_clip.get('path')].duration
 
             clip_start_x = self.header_width + (start_time * self.pixels_per_second)
+            curve_target = None
+            curve_start = None
+            if hit_part in ('fade_in', 'fade_in_curve'):
+                curve_target = 'fade_in_curve'
+                curve_start = float(hit_clip.get('fade_in_curve', 0.0))
+            elif hit_part in ('fade_out', 'fade_out_curve'):
+                curve_target = 'fade_out_curve'
+                curve_start = float(hit_clip.get('fade_out_curve', 0.0))
+
             self._drag_state = {
                 'mode': hit_part,  # 'move' | 'trim_start' | 'trim_end'
                 'track_idx': hit_track_idx,
                 'clip': hit_clip,
                 'mouse_x': event.x,
                 'mouse_y': event.y,
+                'mouse_y_start': event.y,
+                'curve_target': curve_target,
+                'curve_start': curve_start,
                 'start_time': start_time,
                 'duration': duration,
                 'source_start': source_start,
@@ -667,25 +811,27 @@ class TimelineCanvas(tk.Canvas):
                 self.selected_clip = None
                 self._draw()
 
-        # Check if click is in ruler area
-        if event.y < self.ruler_height and event.x > self.header_width:
+        # Click anywhere in the timeline content (including ruler) moves playhead
+        if event.x > self.header_width:
             time = (event.x - self.header_width) / self.pixels_per_second
             self.set_playhead(time)
             if self.on_playhead_change:
                 self.on_playhead_change(self.playhead_position)
+            self._drag_playhead = True
 
     def _on_drag(self, event):
         if self._drag_state:
             self._apply_drag(event.x, event.y)
             return
 
-        if event.y < self.ruler_height + 20 and event.x > self.header_width:
+        if self._drag_playhead and event.x > self.header_width:
             time = max(0, min(self.duration, (event.x - self.header_width) / self.pixels_per_second))
             self.set_playhead(time)
             if self.on_playhead_change:
                 self.on_playhead_change(self.playhead_position)
 
     def _on_release(self, event):
+        self._drag_playhead = False
         if not self._drag_state:
             return
         self._drag_state = None
@@ -722,8 +868,10 @@ class TimelineCanvas(tk.Canvas):
         hit = self._hit_test_clip(event.x, event.y)
         if hit:
             _, _, part = hit
-            if part in ('trim_start', 'trim_end'):
+            if part in ('trim_start', 'trim_end', 'fade_in', 'fade_out'):
                 cursor = 'sb_h_double_arrow'
+            elif part in ('fade_in_curve', 'fade_out_curve'):
+                cursor = 'sb_v_double_arrow'
             else:
                 cursor = 'fleur'
 
@@ -751,7 +899,7 @@ class TimelineCanvas(tk.Canvas):
         return (x1, y1, x2, y2)
 
     def _hit_test_clip(self, x: int, y: int) -> Optional[tuple]:
-        """Return (track_idx, clip, part) where part is move/trim_start/trim_end."""
+        """Return (track_idx, clip, part) where part is move/trim_start/trim_end/fade_in/fade_out/fade_*_curve."""
         for track_idx, track in enumerate(self.tracks):
             for clip in track.get('clips', []):
                 rect = self._clip_rect(clip, track_idx)
@@ -759,6 +907,49 @@ class TimelineCanvas(tk.Canvas):
                     continue
                 x1, y1, x2, y2 = rect
                 if x1 <= x <= x2 and y1 <= y <= y2:
+                    if not clip.get('loading'):
+                        is_selected = clip is self.selected_clip
+                        handle_y = y1 + self._fade_handle_y_offset
+                        r = self._fade_handle_radius
+                        r2 = r * r
+
+                        fade_in = float(clip.get('fade_in', 0.0))
+                        fade_in_x = x1 + (fade_in * self.pixels_per_second)
+                        fade_in_x = max(x1, min(fade_in_x, x2))
+                        if ((x - fade_in_x) * (x - fade_in_x) + (y - handle_y) * (y - handle_y)) <= r2:
+                            return (track_idx, clip, 'fade_in')
+
+                        fade_out = float(clip.get('fade_out', 0.0))
+                        fade_out_x = x2 - (fade_out * self.pixels_per_second)
+                        fade_out_x = max(x1, min(fade_out_x, x2))
+                        if ((x - fade_out_x) * (x - fade_out_x) + (y - handle_y) * (y - handle_y)) <= r2:
+                            return (track_idx, clip, 'fade_out')
+
+                        if is_selected:
+                            line_top = y1 + 2
+                            line_bottom = y2 - 2
+                            line_height = max(1, line_bottom - line_top)
+                            curve_r = max(3, r - 2)
+                            curve_r2 = curve_r * curve_r
+
+                            if fade_in > 0:
+                                fade_px = fade_in_x - x1
+                                if fade_px >= (curve_r * 4):
+                                    mid_x = x1 + (fade_px / 2)
+                                    mid_g = self._curve_gain(0.5, clip.get('fade_in_curve', 0.0))
+                                    mid_y = line_bottom - (mid_g * line_height)
+                                    if ((x - mid_x) * (x - mid_x) + (y - mid_y) * (y - mid_y)) <= curve_r2:
+                                        return (track_idx, clip, 'fade_in_curve')
+
+                            if fade_out > 0:
+                                fade_px = x2 - fade_out_x
+                                if fade_px >= (curve_r * 4):
+                                    mid_x = fade_out_x + (fade_px / 2)
+                                    mid_g = self._curve_gain(0.5, clip.get('fade_out_curve', 0.0))
+                                    mid_y = line_bottom - (mid_g * line_height)
+                                    if ((x - mid_x) * (x - mid_x) + (y - mid_y) * (y - mid_y)) <= curve_r2:
+                                        return (track_idx, clip, 'fade_out_curve')
+
                     if (x - x1) <= self._clip_edge_px and (x2 - x1) >= (self._clip_edge_px * 2):
                         return (track_idx, clip, 'trim_start')
                     if (x2 - x) <= self._clip_edge_px and (x2 - x1) >= (self._clip_edge_px * 2):
@@ -817,6 +1008,8 @@ class TimelineCanvas(tk.Canvas):
             clip['start'] = max(0.0, proposed_start)
             clip['duration'] = max(self._min_clip_duration, new_duration)
             clip['source_start'] = max(0.0, new_source_start)
+            clip['fade_in'] = max(0.0, min(float(clip.get('fade_in', 0.0)), float(clip['duration'])))
+            clip['fade_out'] = max(0.0, min(float(clip.get('fade_out', 0.0)), float(clip['duration'])))
 
         elif mode == 'trim_end':
             original_start = float(state['start_time'])
@@ -832,6 +1025,50 @@ class TimelineCanvas(tk.Canvas):
                 new_duration = min(new_duration, max_duration)
 
             clip['duration'] = max(self._min_clip_duration, new_duration)
+            clip['fade_in'] = max(0.0, min(float(clip.get('fade_in', 0.0)), float(clip['duration'])))
+            clip['fade_out'] = max(0.0, min(float(clip.get('fade_out', 0.0)), float(clip['duration'])))
+
+        elif mode == 'fade_in':
+            clip_start = float(clip.get('start', 0.0))
+            clip_duration = float(clip.get('duration', 0.0))
+            start_x = self.header_width + (clip_start * self.pixels_per_second)
+            new_fade = (float(x) - float(start_x)) / self.pixels_per_second
+            clip['fade_in'] = max(0.0, min(float(new_fade), float(clip_duration)))
+            if state.get('curve_target') == 'fade_in_curve' and state.get('curve_start') is not None:
+                dy = float(y) - float(state.get('mouse_y_start', y))
+                curve = float(state['curve_start']) - (dy / 10.0)
+                clip['fade_in_curve'] = max(-5.0, min(5.0, curve))
+
+        elif mode == 'fade_out':
+            clip_start = float(clip.get('start', 0.0))
+            clip_duration = float(clip.get('duration', 0.0))
+            end_x = self.header_width + ((clip_start + clip_duration) * self.pixels_per_second)
+            new_fade = (float(end_x) - float(x)) / self.pixels_per_second
+            clip['fade_out'] = max(0.0, min(float(new_fade), float(clip_duration)))
+            if state.get('curve_target') == 'fade_out_curve' and state.get('curve_start') is not None:
+                dy = float(y) - float(state.get('mouse_y_start', y))
+                curve = float(state['curve_start']) - (dy / 10.0)
+                clip['fade_out_curve'] = max(-5.0, min(5.0, curve))
+
+        elif mode == 'fade_in_curve':
+            track_y = self.ruler_height + track_idx * self.track_height
+            clip_y1 = track_y + 4
+            clip_y2 = track_y + self.track_height - 4
+            line_top = clip_y1 + 2
+            line_bottom = clip_y2 - 2
+            line_height = max(1, line_bottom - line_top)
+            gain = (line_bottom - float(y)) / float(line_height)
+            clip['fade_in_curve'] = self._curve_from_mid_gain(gain)
+
+        elif mode == 'fade_out_curve':
+            track_y = self.ruler_height + track_idx * self.track_height
+            clip_y1 = track_y + 4
+            clip_y2 = track_y + self.track_height - 4
+            line_top = clip_y1 + 2
+            line_bottom = clip_y2 - 2
+            line_height = max(1, line_bottom - line_top)
+            gain = (line_bottom - float(y)) / float(line_height)
+            clip['fade_out_curve'] = self._curve_from_mid_gain(gain)
 
         self._draw()
 
@@ -841,9 +1078,46 @@ class TimelineCanvas(tk.Canvas):
             if clips:
                 clips.sort(key=lambda c: float(c.get('start', 0.0)))
 
+    def _curve_gain(self, t: float, curve: float) -> float:
+        """Map a 0..1 ramp to a curved ramp (0=linear)."""
+        t = max(0.0, min(1.0, float(t)))
+        try:
+            curve = float(curve)
+        except Exception:
+            curve = 0.0
+
+        if abs(curve) < 1e-6:
+            return t
+
+        power = 1.0 + min(8.0, abs(curve))
+        if curve > 0:
+            return t ** power
+        return 1.0 - ((1.0 - t) ** power)
+
+    def _curve_from_mid_gain(self, gain: float) -> float:
+        """Invert curve based on midpoint gain at t=0.5."""
+        try:
+            gain = float(gain)
+        except Exception:
+            return 0.0
+
+        gain = max(0.001, min(0.999, gain))
+        if abs(gain - 0.5) < 1e-3:
+            return 0.0
+
+        log_half = math.log(0.5)
+        if gain < 0.5:
+            power = math.log(gain) / log_half
+            curve = power - 1.0
+            return max(0.0, min(5.0, curve))
+
+        power = math.log(1.0 - gain) / log_half
+        curve = -(power - 1.0)
+        return min(0.0, max(-5.0, curve))
+
     def set_playhead(self, position: float):
         self.playhead_position = max(0, min(position, self.duration))
-        self._draw()
+        self._update_playhead_visual()
 
     def set_zoom(self, pixels_per_second: int):
         self.pixels_per_second = max(10, min(300, pixels_per_second))
@@ -853,6 +1127,8 @@ class TimelineCanvas(tk.Canvas):
     def _draw(self):
         self.delete('all')
         self._add_buttons.clear()
+        self._playhead_line_id = None
+        self._playhead_handle_id = None
         width = self.winfo_width()
         height = self.winfo_height()
 
@@ -1011,6 +1287,69 @@ class TimelineCanvas(tk.Canvas):
         if not is_loading and self.audio_engine and clip.get('path') and clip_width > 10:
             self._draw_waveform(clip, track, start_x, clip_y1, clip_width, clip_height)
 
+        # Fade handles / lines
+        if not is_loading:
+            fade_in = max(0.0, float(clip.get('fade_in', 0.0)))
+            fade_out = max(0.0, float(clip.get('fade_out', 0.0)))
+
+            if is_selected or fade_in > 0 or fade_out > 0:
+                r = self._fade_handle_radius
+                handle_y = clip_y1 + self._fade_handle_y_offset
+                line_top = clip_y1 + 2
+                line_bottom = clip_y2 - 2
+                line_height = max(1, line_bottom - line_top)
+                curve_r = max(3, r - 2)
+
+                fade_in_x = start_x + int(fade_in * self.pixels_per_second)
+                fade_in_x = max(start_x, min(fade_in_x, end_x))
+                if fade_in > 0:
+                    fade_px = max(1, fade_in_x - start_x)
+                    steps = max(4, min(32, fade_px // 8))
+                    curve = clip.get('fade_in_curve', 0.0)
+                    points = []
+                    for i in range(steps + 1):
+                        p = i / steps
+                        g = self._curve_gain(p, curve)
+                        x = start_x + int(p * fade_px)
+                        y = int(line_bottom - g * line_height)
+                        points.extend([x, y])
+                    if len(points) >= 4:
+                        self.create_line(points, fill='#ffd24a', width=1, smooth=True)
+
+                    if is_selected and fade_px >= (curve_r * 4):
+                        mid_x = start_x + (fade_px / 2)
+                        mid_g = self._curve_gain(0.5, curve)
+                        mid_y = int(line_bottom - mid_g * line_height)
+                        self.create_oval(mid_x - curve_r, mid_y - curve_r, mid_x + curve_r, mid_y + curve_r,
+                                         fill='#ffd24a', outline='')
+                self.create_oval(fade_in_x - r, handle_y - r, fade_in_x + r, handle_y + r,
+                                 fill='#ffffff', outline='')
+
+                fade_out_x = end_x - int(fade_out * self.pixels_per_second)
+                fade_out_x = max(start_x, min(fade_out_x, end_x))
+                if fade_out > 0:
+                    fade_px = max(1, end_x - fade_out_x)
+                    steps = max(4, min(32, fade_px // 8))
+                    curve = clip.get('fade_out_curve', 0.0)
+                    points = []
+                    for i in range(steps + 1):
+                        p = i / steps
+                        g = self._curve_gain(1.0 - p, curve)
+                        x = fade_out_x + int(p * fade_px)
+                        y = int(line_bottom - g * line_height)
+                        points.extend([x, y])
+                    if len(points) >= 4:
+                        self.create_line(points, fill='#ffd24a', width=1, smooth=True)
+
+                    if is_selected and fade_px >= (curve_r * 4):
+                        mid_x = fade_out_x + (fade_px / 2)
+                        mid_g = self._curve_gain(0.5, curve)
+                        mid_y = int(line_bottom - mid_g * line_height)
+                        self.create_oval(mid_x - curve_r, mid_y - curve_r, mid_x + curve_r, mid_y + curve_r,
+                                         fill='#ffd24a', outline='')
+                self.create_oval(fade_out_x - r, handle_y - r, fade_out_x + r, handle_y + r,
+                                 fill='#ffffff', outline='')
+
         # Clip name (top left)
         clip_name = clip.get('name', 'Clip')
         if len(clip_name) > 25:
@@ -1043,11 +1382,26 @@ class TimelineCanvas(tk.Canvas):
 
         source_start = float(clip.get('source_start', 0.0))
         duration = float(clip.get('duration', 0.0))
-        cache_key = (filepath, int(clip_width), round(source_start, 3), round(duration, 3))
 
+        end_x = start_x + int(clip_width)
+        canvas_width = self.winfo_width()
+
+        visible_x1 = max(start_x, self.header_width)
+        visible_x2 = min(end_x, canvas_width)
+        visible_width = int(visible_x2 - visible_x1)
+        if visible_width < 10:
+            return
+
+        visible_offset = (visible_x1 - start_x) / self.pixels_per_second
+        segment_source_start = source_start + max(0.0, float(visible_offset))
+        segment_duration = min(duration - max(0.0, float(visible_offset)), visible_width / self.pixels_per_second)
+        if segment_duration <= 0:
+            return
+
+        cache_key = (filepath, visible_width, round(segment_source_start, 3), round(segment_duration, 3))
         waveform = self._waveform_cache.get(cache_key)
         if waveform is None:
-            waveform = self.audio_engine.get_waveform_segment(filepath, clip_width, source_start, duration)
+            waveform = self.audio_engine.get_waveform_segment(filepath, visible_width, segment_source_start, segment_duration)
             if waveform:
                 self._waveform_cache[cache_key] = waveform
 
@@ -1061,18 +1415,18 @@ class TimelineCanvas(tk.Canvas):
         # Build simple polygon - much fewer points
         points = []
         num_points = len(waveform)
-        pixel_step = (clip_width - 4) / max(1, num_points - 1)
+        pixel_step = (visible_width - 4) / max(1, num_points - 1)
 
         # Top edge (max values)
         for i, (min_val, max_val) in enumerate(waveform):
-            x = start_x + 2 + int(i * pixel_step)
+            x = int(visible_x1 + 2 + (i * pixel_step))
             y = int(center_y - max_val * max_amplitude)
             points.extend([x, y])
 
         # Bottom edge (min values, reversed)
         for i in range(num_points - 1, -1, -1):
             min_val, max_val = waveform[i]
-            x = start_x + 2 + int(i * pixel_step)
+            x = int(visible_x1 + 2 + (i * pixel_step))
             y = int(center_y - min_val * max_amplitude)
             points.extend([x, y])
 
@@ -1091,13 +1445,43 @@ class TimelineCanvas(tk.Canvas):
         return f'#{r:02x}{g:02x}{b:02x}'
 
     def _draw_playhead(self, height):
-        x = self.header_width + int(self.playhead_position * self.pixels_per_second)
+        self._update_playhead_visual(height)
 
-        # Playhead line
-        self.create_line(x, 0, x, height, fill='#ff4444', width=2)
+    def _update_playhead_visual(self, height: Optional[int] = None):
+        if height is None:
+            height = self.winfo_height()
+        if height < 1:
+            return
 
-        # Triangle handle
-        self.create_polygon(x - 8, 0, x + 8, 0, x, 12, fill='#ff4444', outline='')
+        x = self.header_width + int(round(self.playhead_position * self.pixels_per_second))
+        if self._playhead_line_id is None:
+            self._playhead_line_id = self.create_line(
+                x, 0, x, height,
+                fill='#ff4444',
+                width=2,
+                tags=('playhead',),
+            )
+        else:
+            try:
+                self.coords(self._playhead_line_id, x, 0, x, height)
+            except Exception:
+                self._playhead_line_id = None
+                return self._update_playhead_visual(height)
+
+        if self._playhead_handle_id is None:
+            self._playhead_handle_id = self.create_polygon(
+                x - 8, 0, x + 8, 0, x, 12,
+                fill='#ff4444',
+                outline='',
+                tags=('playhead',),
+            )
+        else:
+            try:
+                self.coords(self._playhead_handle_id, x - 8, 0, x + 8, 0, x, 12)
+            except Exception:
+                self._playhead_handle_id = None
+
+        self.tag_raise('playhead')
 
 
 class WaveSyncApp:
@@ -1121,6 +1505,11 @@ class WaveSyncApp:
         # Current preview image
         self.preview_image = None
         self.current_video_clip = None
+        self._preview_lock = threading.Lock()
+        self._preview_event = threading.Event()
+        self._preview_request: Optional[tuple] = None  # (request_id, filepath, time)
+        self._preview_request_id = 0
+        self._preview_worker_started = False
 
         # Apply dark theme
         self._setup_style()
@@ -1361,6 +1750,15 @@ class WaveSyncApp:
         self._update_time_display()
         self._update_preview_for_time(self.playhead_position)
 
+        if self.is_playing and self.audio_engine.is_active():
+            all_clips = []
+            for track in self._get_audible_tracks():
+                for clip in track.get('clips', []):
+                    if clip.get('loading'):
+                        continue
+                    all_clips.append(clip)
+            self.audio_engine.set_clips(all_clips)
+
     def _update_preview_for_time(self, time: float):
         """Update preview image for the given time position."""
         # Find video clip at current time
@@ -1374,12 +1772,49 @@ class WaveSyncApp:
 
     def _show_video_frame(self, filepath: str, time: float):
         """Extract and show video frame."""
-        def extract():
-            frame = VideoFrameExtractor.extract_frame(filepath, time, 400, 225)
-            if frame:
-                self.root.after(0, lambda: self._display_frame(frame))
+        with self._preview_lock:
+            self._preview_request_id += 1
+            request_id = self._preview_request_id
+            self._preview_request = (request_id, filepath, float(time))
 
-        threading.Thread(target=extract, daemon=True).start()
+            if not self._preview_worker_started:
+                self._preview_worker_started = True
+                threading.Thread(target=self._preview_worker, daemon=True).start()
+
+        self._preview_event.set()
+
+    def _preview_worker(self):
+        while True:
+            self._preview_event.wait()
+            self._preview_event.clear()
+
+            with self._preview_lock:
+                request = self._preview_request
+
+            if not request:
+                continue
+
+            request_id, filepath, time = request
+            try:
+                frame = VideoFrameExtractor.extract_frame(filepath, time, 400, 225)
+            except Exception as e:
+                print(f"Frame extraction error: {e}")
+                frame = None
+
+            if not frame:
+                continue
+
+            def maybe_display():
+                with self._preview_lock:
+                    latest = self._preview_request
+                    if not latest or latest[0] != request_id:
+                        return
+                self._display_frame(frame)
+
+            try:
+                self.root.after(0, maybe_display)
+            except Exception:
+                return
 
     def _display_frame(self, image: Image.Image):
         """Display frame in preview area."""
@@ -1420,6 +1855,12 @@ class WaveSyncApp:
         # Set clips and start playback
         self.audio_engine.set_clips(all_clips)
         self.audio_engine.play(start_time=self.playhead_position)
+
+        if not self.audio_engine.is_active():
+            self.is_playing = False
+            self.play_btn.config(text="▶", bg='#4ade80')
+            self.status_label.config(text="Audio output unavailable")
+            return
 
         self._playback_tick()
 
@@ -1464,7 +1905,7 @@ class WaveSyncApp:
     def _playback_tick(self):
         if self.is_playing:
             # Sync playhead position with audio engine
-            self.playhead_position = self.audio_engine.get_position()
+            self.playhead_position = self.audio_engine.get_position_for_ui()
 
             if self.playhead_position >= self.project_duration:
                 self.playhead_position = self.project_duration
@@ -1568,6 +2009,10 @@ class WaveSyncApp:
                 'duration': 10.0,  # Placeholder duration
                 'source_start': 0.0,
                 'media_duration': None,
+                'fade_in': 0.0,
+                'fade_out': 0.0,
+                'fade_in_curve': 0.0,
+                'fade_out_curve': 0.0,
                 'loading': True,
             }
             track['clips'].append(clip)
@@ -1589,6 +2034,10 @@ class WaveSyncApp:
             clip['duration'] = duration
             clip['source_start'] = float(clip.get('source_start', 0.0))
             clip['media_duration'] = float(duration)
+            clip['fade_in'] = float(clip.get('fade_in', 0.0))
+            clip['fade_out'] = float(clip.get('fade_out', 0.0))
+            clip['fade_in_curve'] = float(clip.get('fade_in_curve', 0.0))
+            clip['fade_out_curve'] = float(clip.get('fade_out_curve', 0.0))
             clip['loading'] = False
 
             # Update project duration if needed
@@ -1672,17 +2121,29 @@ class WaveSyncApp:
                 start = float(clip.get('start', 0.0))
                 duration = float(clip.get('duration', 0.0))
                 source_start = float(clip.get('source_start', 0.0))
+                fade_in = float(clip.get('fade_in', 0.0))
+                fade_out = float(clip.get('fade_out', 0.0))
+                fade_in_curve = float(clip.get('fade_in_curve', 0.0))
+                fade_out_curve = float(clip.get('fade_out_curve', 0.0))
 
                 if duration <= 0:
                     continue
 
+                fade_in = max(0.0, min(fade_in, duration))
+                fade_out = max(0.0, min(fade_out, duration))
+
                 end_time = max(end_time, start + duration)
 
+                duration_frames = int(round(duration * sample_rate))
                 clip_specs.append({
                     'audio': loaded,
                     'start_frame': int(round(start * sample_rate)),
-                    'duration_frames': int(round(duration * sample_rate)),
+                    'duration_frames': duration_frames,
                     'source_start_frame': int(round(source_start * sample_rate)),
+                    'fade_in_frames': int(round(fade_in * sample_rate)),
+                    'fade_out_frames': int(round(fade_out * sample_rate)),
+                    'fade_in_curve': fade_in_curve,
+                    'fade_out_curve': fade_out_curve,
                 })
 
             if not clip_specs or end_time <= 0:
@@ -1722,9 +2183,26 @@ class WaveSyncApp:
                         clip_offset = overlap_start - clip_start
 
                         src_frame = spec['source_start_frame'] + clip_offset
-                        mixed[out_offset:out_offset + frames_to_mix] += spec['audio'].get_samples_by_frame(
-                            src_frame, frames_to_mix
-                        )
+                        samples = spec['audio'].get_samples_by_frame(src_frame, frames_to_mix)
+
+                        fade_in_frames = int(spec.get('fade_in_frames', 0) or 0)
+                        fade_out_frames = int(spec.get('fade_out_frames', 0) or 0)
+                        duration_frames = int(spec.get('duration_frames', 0) or 0)
+                        if duration_frames > 0 and (fade_in_frames > 0 or fade_out_frames > 0):
+                            positions = clip_offset + np.arange(frames_to_mix, dtype=np.float32)
+                            gains = np.ones(frames_to_mix, dtype=np.float32)
+
+                            if fade_in_frames > 0:
+                                t_in = np.clip(positions / fade_in_frames, 0.0, 1.0)
+                                gains = np.minimum(gains, AudioEngine._apply_fade_curve(t_in, spec.get('fade_in_curve', 0.0)))
+                            if fade_out_frames > 0:
+                                remaining = float(duration_frames) - positions
+                                t_out = np.clip(remaining / fade_out_frames, 0.0, 1.0)
+                                gains = np.minimum(gains, AudioEngine._apply_fade_curve(t_out, spec.get('fade_out_curve', 0.0)))
+
+                            samples = samples * gains[:, None]
+
+                        mixed[out_offset:out_offset + frames_to_mix] += samples
 
                     np.clip(mixed, -1.0, 1.0, out=mixed)
                     pcm = (mixed * 32767.0).astype(np.int16)
