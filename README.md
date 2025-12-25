@@ -1,145 +1,72 @@
-# ClipTune - Audio/Video Editor
+# ClipTune - Audio/Video Editor (Python)
 
-A simple audio and video editing application built with C++20, Qt 6, and FFmpeg. ClipTune provides a timeline-based editing experience similar to a simplified Audacity combined with basic video editing capabilities.
+A timeline-based audio and video editing application built with Python, PyQt6, and FFmpeg.
 
-## Features
+## Project Goal
 
-### MVP Capabilities
-- Import audio/video files (via FFmpeg)
+Create a simple yet functional audio/video editor similar to a simplified Audacity with video support. The focus is on fast development iteration and maintainability.
+
+## Target Features
+
+### Core Features
+- Import audio/video files (MP3, WAV, MP4, MOV, etc.)
 - Timeline with multiple tracks (audio + video)
-- Clip trim, move, and split operations
+- Clip operations: trim, move, split, delete
 - Audio mixing with multi-track support
-- Per-clip gain control
-- **Fade-in/fade-out** per audio clip (linear, exponential, S-curve)
-- Preview playback (audio as master clock, video synced)
+- Per-clip gain/volume control
+- Fade-in/fade-out per audio clip (linear, exponential, S-curve)
+- Preview playback with audio/video sync
 - Export to MP4 (H.264 + AAC) and WAV
+
+### UI Components
+- Main window with menu bar and toolbar
+- Timeline widget with tracks
+- Video preview panel
+- Track headers with mute/solo controls
+- Time ruler
+- Waveform visualization
 
 ## Tech Stack
 
-- **C++20** - Modern C++ standard
-- **Qt 6** - UI framework with `QAudioSink` for audio output
-- **FFmpeg** - Media decoding/encoding (libavformat, libavcodec, libavutil, swresample, swscale)
-- **CMake** - Build system
-- **vcpkg** - Dependency management
+- **Python 3.11+** - Main language
+- **PyQt6** - UI framework
+- **ffmpeg-python** or **PyAV** - Media decoding/encoding
+- **numpy** - Audio processing
+- **sounddevice** - Audio playback
 
-## Prerequisites (Windows)
-
-### 1. Visual Studio 2022
-- Install with "Desktop development with C++" workload
-- Components: MSVC toolset, Windows SDK
-
-### 2. CMake
-- Version 3.20 or later
-- Install from cmake.org or via VS installer
-
-### 3. Qt 6
-**Option A (Recommended): Qt Online Installer**
-- Download from qt.io
-- Install Qt 6.x for MSVC 2022 64-bit
-- Note the installation path for CMake configuration
-
-**Option B: Qt via vcpkg**
-- Possible but slower to build
-
-### 4. vcpkg
-```bash
-git clone https://github.com/microsoft/vcpkg.git
-cd vcpkg
-.\bootstrap-vcpkg.bat
-```
-
-## Building
-
-### 1. Clone the repository
-```bash
-git clone https://github.com/ysetbon/AudioVideo.git
-cd AudioVideo
-```
-
-### 2. Configure with CMake
-```bash
-mkdir build
-cd build
-cmake .. -DCMAKE_TOOLCHAIN_FILE=<path-to-vcpkg>/scripts/buildsystems/vcpkg.cmake \
-         -DCMAKE_PREFIX_PATH=<path-to-Qt6>/msvc2022_64
-```
-
-### 3. Build
-```bash
-cmake --build . --config Release
-```
-
-### 4. Deploy (Windows)
-```bash
-# Copy Qt runtime DLLs
-<path-to-Qt6>/msvc2022_64/bin/windeployqt.exe ClipTune.exe
-
-# Copy FFmpeg DLLs from vcpkg
-```
-
-## Project Structure
+## Architecture
 
 ```
-ClipTune/
-├── CMakeLists.txt          # Main CMake configuration
-├── vcpkg.json              # vcpkg dependencies
-├── src/
-│   ├── main.cpp            # Application entry point
-│   ├── app/
-│   │   └── Application.*   # Application initialization
-│   ├── core/
-│   │   ├── Project.*       # Project model
-│   │   ├── Track.*         # Track model
-│   │   ├── Clip.*          # Clip model with fade settings
-│   │   ├── UndoStack.*     # Undo/redo system
-│   │   └── Commands.*      # Command pattern implementations
-│   ├── media/
-│   │   ├── FfmpegInit.*    # FFmpeg initialization and RAII wrappers
-│   │   ├── Demuxer.*       # Container demuxing
-│   │   ├── AudioDecoder.*  # Audio decoding
-│   │   ├── VideoDecoder.*  # Video decoding
-│   │   ├── Resampler.*     # Audio resampling
-│   │   ├── Scaler.*        # Video scaling
-│   │   └── FrameQueues.*   # Thread-safe frame queues
-│   ├── audio/
-│   │   ├── AudioEngine.*   # Audio playback via QAudioSink
-│   │   ├── AudioRingBuffer.* # Lock-free ring buffer
-│   │   ├── Mixer.*         # Multi-track audio mixing
-│   │   └── FadeDSP.*       # Fade envelope processing
-│   ├── ui/
-│   │   ├── MainWindow.*    # Main application window
-│   │   ├── TimelineWidget.*# Timeline view
-│   │   ├── PreviewWidget.* # Video preview
-│   │   ├── ClipItem.*      # Clip visualization
-│   │   ├── RulerWidget.*   # Time ruler
-│   │   ├── TrackHeaderWidget.* # Track controls
-│   │   └── WaveformCache.* # Waveform generation/caching
-│   └── render/
-│       ├── ExportJob.*     # Export task management
-│       └── Mp4Muxer.*      # MP4/WAV encoding
+cliptune/
+├── main.py              # Entry point
+├── requirements.txt     # Dependencies
+├── core/
+│   ├── project.py       # Project model
+│   ├── track.py         # Track model
+│   ├── clip.py          # Clip model with fade settings
+│   └── commands.py      # Undo/redo command pattern
+├── media/
+│   ├── decoder.py       # Audio/video decoding
+│   ├── encoder.py       # Export encoding
+│   └── waveform.py      # Waveform generation
+├── audio/
+│   ├── engine.py        # Audio playback
+│   ├── mixer.py         # Multi-track mixing
+│   └── effects.py       # Fade/gain processing
+└── ui/
+    ├── main_window.py   # Main application window
+    ├── timeline.py      # Timeline widget
+    ├── preview.py       # Video preview
+    ├── clip_item.py     # Clip visualization
+    ├── ruler.py         # Time ruler
+    └── track_header.py  # Track controls
 ```
 
-## Audio Format
+## Audio Format (Internal)
 
-Internal processing uses:
 - Sample rate: **48000 Hz**
 - Channels: **2** (stereo)
-- Sample type: **float32**
-
-## Fade Implementation
-
-Fades are non-destructive and applied in real-time during mixing:
-
-```
-Gain multiplier g(t) where t = time from clip start:
-
-Linear:
-- Fade in:  g = t / fadeInDuration      (for t < fadeIn)
-- Fade out: g = (L - t) / fadeOutDuration (for t > L - fadeOut)
-- Otherwise: g = 1.0
-
-Final sample = source_sample × g(t) × clipGain × trackVolume
-```
+- Sample type: **float32** (numpy)
 
 ## Keyboard Shortcuts
 
@@ -151,13 +78,21 @@ Final sample = source_sample × g(t) × clipGain × trackVolume
 - **Ctrl+Y** - Redo
 - **Delete** - Delete selected clip
 - **S** - Split clip at playhead
-- **Ctrl+0** - Zoom to fit
-- **Ctrl++/-** - Zoom in/out
+
+## Getting Started
+
+```bash
+# Create virtual environment
+python -m venv venv
+venv\Scripts\activate  # Windows
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run
+python main.py
+```
 
 ## License
 
-MIT License - See LICENSE file for details.
-
-## FFmpeg Licensing Note
-
-FFmpeg features can toggle between LGPL and GPL depending on enabled codecs. The default vcpkg build uses LGPL-compatible options. If distributing commercially, verify your FFmpeg build's license obligations.
+MIT License

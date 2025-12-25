@@ -1,44 +1,53 @@
-# Build directories
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 build/
-out/
-cmake-build-*/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
 
 # IDE
 .vs/
 .vscode/
 *.user
-*.suo
-*.sln
-*.vcxproj*
 .idea/
 *.swp
 *~
 
-# Qt
-*.pro.user*
-moc_*.cpp
-ui_*.h
-qrc_*.cpp
-
-# Compiled
-*.obj
-*.o
-*.exe
-*.dll
-*.lib
-*.a
-*.pdb
-*.ilk
-*.exp
-
-# vcpkg
-vcpkg_installed/
+# PyQt
+*.pyc
+*.pyo
 
 # OS
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Generated
-*.autosave
+# Project specific
 *.cache
+*.autosave
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
