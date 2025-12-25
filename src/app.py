@@ -4,6 +4,8 @@ import os
 import subprocess
 import threading
 import json
+import math
+import wave
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from typing import Optional, Callable, Dict
@@ -209,17 +211,15 @@ class LoadedAudio:
 
         return list(zip(mins.tolist(), maxs.tolist()))
 
-    def get_waveform_for_width(self, width: int) -> list:
-        """Get waveform data resampled to specified width."""
-        if not self.waveform_overview or width <= 0:
+    def _resample_overview(self, overview: list, width: int) -> list:
+        """Resample an overview (min/max pairs) to the requested width."""
+        if not overview or width <= 0:
             return []
 
-        overview_len = len(self.waveform_overview)
+        overview_len = len(overview)
         if width >= overview_len:
-            # Need to upsample - just return overview
-            return self.waveform_overview
+            return overview
 
-        # Downsample overview to fit width
         result = []
         points_per_pixel = overview_len / width
         for i in range(width):
@@ -227,7 +227,7 @@ class LoadedAudio:
             end = int((i + 1) * points_per_pixel)
             end = min(end, overview_len)
             if start < overview_len:
-                chunk = self.waveform_overview[start:end]
+                chunk = overview[start:end]
                 min_val = min(p[0] for p in chunk)
                 max_val = max(p[1] for p in chunk)
                 result.append((min_val, max_val))
@@ -235,6 +235,32 @@ class LoadedAudio:
                 result.append((0.0, 0.0))
 
         return result
+
+    def get_waveform_for_width(self, width: int) -> list:
+        """Get waveform data resampled to specified width."""
+        if not self.waveform_overview or width <= 0:
+            return []
+
+        return self._resample_overview(self.waveform_overview, width)
+
+    def get_waveform_segment_for_width(self, width: int, source_start: float, duration: float) -> list:
+        """Get waveform data for a segment, resampled to the requested width."""
+        if not self.waveform_overview or width <= 0 or duration <= 0 or self.duration <= 0:
+            return []
+
+        start_time = max(0.0, float(source_start))
+        end_time = min(self.duration, start_time + float(duration))
+        if end_time <= start_time:
+            return []
+
+        overview_len = len(self.waveform_overview)
+        start_idx = int((start_time / self.duration) * overview_len)
+        end_idx = int((end_time / self.duration) * overview_len)
+        start_idx = max(0, min(start_idx, overview_len - 1))
+        end_idx = max(start_idx + 1, min(end_idx, overview_len))
+
+        segment = self.waveform_overview[start_idx:end_idx]
+        return self._resample_overview(segment, width)
 
     def get_samples_at(self, start_time: float, num_samples: int) -> np.ndarray:
         """Get audio samples starting at a specific time."""
@@ -252,6 +278,33 @@ class LoadedAudio:
             return np.vstack([available, padding])
 
         return self.samples[start_sample:end_sample]
+
+    def get_samples_by_frame(self, start_frame: int, num_frames: int) -> np.ndarray:
+        """Get audio samples by frame index (sample index), padding with silence if needed."""
+        if num_frames <= 0:
+            return np.zeros((0, self.channels), dtype=np.float32)
+
+        start_frame = int(start_frame)
+        end_frame = start_frame + int(num_frames)
+
+        if start_frame >= len(self.samples):
+            return np.zeros((num_frames, self.channels), dtype=np.float32)
+
+        if end_frame <= 0:
+            return np.zeros((num_frames, self.channels), dtype=np.float32)
+
+        src_start = max(0, start_frame)
+        src_end = min(len(self.samples), end_frame)
+        chunk = self.samples[src_start:src_end]
+
+        left_pad = max(0, -start_frame)
+        right_pad = max(0, end_frame - len(self.samples))
+        if left_pad or right_pad:
+            out = np.zeros((num_frames, self.channels), dtype=np.float32)
+            out[left_pad:left_pad + len(chunk)] = chunk
+            return out
+
+        return chunk
 
 
 class AudioEngine:
@@ -370,6 +423,7 @@ class AudioEngine:
                         'audio': self.loaded_audio[filepath],
                         'start': clip.get('start', 0),
                         'duration': clip.get('duration', 0),
+                        'source_start': clip.get('source_start', 0.0),
                     })
 
     def _audio_callback(self, outdata, frames, time_info, status):
@@ -392,11 +446,12 @@ class AudioEngine:
                 audio: LoadedAudio = clip['audio']
                 clip_start = clip['start']
                 clip_duration = clip['duration']
+                source_start = clip.get('source_start', 0.0)
 
                 # Check if this clip is active at current time
                 if current_time >= clip_start and current_time < clip_start + clip_duration:
                     # Time within the clip
-                    clip_time = current_time - clip_start
+                    clip_time = (current_time - clip_start) + float(source_start)
                     samples = audio.get_samples_at(clip_time, frames)
                     mixed += samples
 
@@ -481,6 +536,14 @@ class AudioEngine:
         audio = self.loaded_audio[filepath]
         return audio.get_waveform_for_width(width)
 
+    def get_waveform_segment(self, filepath: str, width: int, source_start: float, duration: float) -> Optional[list]:
+        """Get waveform data for a segment of the media."""
+        if filepath not in self.loaded_audio:
+            return None
+
+        audio = self.loaded_audio[filepath]
+        return audio.get_waveform_segment_for_width(width, source_start, duration)
+
 
 class TimelineCanvas(tk.Canvas):
     """Timeline canvas with tracks and playhead."""
@@ -496,6 +559,7 @@ class TimelineCanvas(tk.Canvas):
         self.on_playhead_change: Optional[Callable] = None
         self.on_track_add_media: Optional[Callable] = None
         self.on_clip_select: Optional[Callable] = None
+        self.on_timeline_edited: Optional[Callable[[], None]] = None
 
         # Track configuration
         self.track_height = 80
@@ -514,12 +578,20 @@ class TimelineCanvas(tk.Canvas):
         # Reference to audio engine (set by app)
         self.audio_engine: Optional[AudioEngine] = None
 
+        # Selection / editing state
+        self.selected_clip: Optional[dict] = None
+        self._drag_state: Optional[dict] = None
+
+        self._clip_edge_px = 8
+        self._min_clip_duration = 0.05  # seconds
+
         # Create default tracks
         self._create_default_tracks()
 
         # Bindings
         self.bind('<Button-1>', self._on_click)
         self.bind('<B1-Motion>', self._on_drag)
+        self.bind('<ButtonRelease-1>', self._on_release)
         self.bind('<Configure>', self._on_resize)
         self.bind('<Motion>', self._on_motion)
 
@@ -540,6 +612,61 @@ class TimelineCanvas(tk.Canvas):
                     self.on_track_add_media(track_idx, self.tracks[track_idx])
                 return
 
+        # Track M/S buttons
+        track_idx = self._track_index_at_y(event.y)
+        if track_idx is not None and event.x < self.header_width:
+            track_y = self.ruler_height + track_idx * self.track_height
+            if 12 <= event.x <= 36 and (track_y + 50) <= event.y <= (track_y + 70):
+                self.tracks[track_idx]['muted'] = not self.tracks[track_idx].get('muted', False)
+                self._draw()
+                if self.on_timeline_edited:
+                    self.on_timeline_edited()
+                return
+            if 42 <= event.x <= 66 and (track_y + 50) <= event.y <= (track_y + 70):
+                self.tracks[track_idx]['solo'] = not self.tracks[track_idx].get('solo', False)
+                self._draw()
+                if self.on_timeline_edited:
+                    self.on_timeline_edited()
+                return
+
+        # Clip selection / drag begin
+        hit = self._hit_test_clip(event.x, event.y)
+        if hit:
+            hit_track_idx, hit_clip, hit_part = hit
+            if hit_clip.get('loading'):
+                return
+
+            self.selected_clip = hit_clip
+            if self.on_clip_select:
+                self.on_clip_select(hit_clip, hit_track_idx)
+
+            start_time = float(hit_clip.get('start', 0.0))
+            duration = float(hit_clip.get('duration', 0.0))
+            source_start = float(hit_clip.get('source_start', 0.0))
+            media_duration = hit_clip.get('media_duration')
+            if media_duration is None and self.audio_engine and hit_clip.get('path') in self.audio_engine.loaded_audio:
+                media_duration = self.audio_engine.loaded_audio[hit_clip.get('path')].duration
+
+            clip_start_x = self.header_width + (start_time * self.pixels_per_second)
+            self._drag_state = {
+                'mode': hit_part,  # 'move' | 'trim_start' | 'trim_end'
+                'track_idx': hit_track_idx,
+                'clip': hit_clip,
+                'mouse_x': event.x,
+                'mouse_y': event.y,
+                'start_time': start_time,
+                'duration': duration,
+                'source_start': source_start,
+                'media_duration': float(media_duration) if media_duration is not None else None,
+                'grab_offset_x': float(event.x) - float(clip_start_x),
+            }
+            self._draw()
+            return
+        else:
+            if self.selected_clip is not None:
+                self.selected_clip = None
+                self._draw()
+
         # Check if click is in ruler area
         if event.y < self.ruler_height and event.x > self.header_width:
             time = (event.x - self.header_width) / self.pixels_per_second
@@ -548,23 +675,171 @@ class TimelineCanvas(tk.Canvas):
                 self.on_playhead_change(self.playhead_position)
 
     def _on_drag(self, event):
+        if self._drag_state:
+            self._apply_drag(event.x, event.y)
+            return
+
         if event.y < self.ruler_height + 20 and event.x > self.header_width:
             time = max(0, min(self.duration, (event.x - self.header_width) / self.pixels_per_second))
             self.set_playhead(time)
             if self.on_playhead_change:
                 self.on_playhead_change(self.playhead_position)
 
+    def _on_release(self, event):
+        if not self._drag_state:
+            return
+        self._drag_state = None
+        self._sort_all_tracks()
+        self._draw()
+        if self.on_timeline_edited:
+            self.on_timeline_edited()
+
     def _on_resize(self, event):
         self._draw()
 
     def _on_motion(self, event):
-        # Check if hovering over add button
-        hovering = False
+        if self._drag_state:
+            return
+
+        cursor = ''
+
+        # Add button hover
         for track_idx, (x1, y1, x2, y2) in self._add_buttons.items():
             if x1 <= event.x <= x2 and y1 <= event.y <= y2:
-                hovering = True
-                break
-        self.config(cursor='hand2' if hovering else '')
+                cursor = 'hand2'
+                self.config(cursor=cursor)
+                return
+
+        # Track M/S hover
+        track_idx = self._track_index_at_y(event.y)
+        if track_idx is not None and event.x < self.header_width:
+            track_y = self.ruler_height + track_idx * self.track_height
+            if ((12 <= event.x <= 36) or (42 <= event.x <= 66)) and ((track_y + 50) <= event.y <= (track_y + 70)):
+                self.config(cursor='hand2')
+                return
+
+        # Clip hover
+        hit = self._hit_test_clip(event.x, event.y)
+        if hit:
+            _, _, part = hit
+            if part in ('trim_start', 'trim_end'):
+                cursor = 'sb_h_double_arrow'
+            else:
+                cursor = 'fleur'
+
+        self.config(cursor=cursor)
+
+    def _track_index_at_y(self, y: int) -> Optional[int]:
+        if y < self.ruler_height:
+            return None
+        rel = y - self.ruler_height
+        idx = int(rel // self.track_height)
+        if 0 <= idx < len(self.tracks):
+            return idx
+        return None
+
+    def _clip_rect(self, clip: dict, track_idx: int) -> Optional[tuple]:
+        """Return (x1, y1, x2, y2) in canvas coords for a clip."""
+        if 'start' not in clip or 'duration' not in clip:
+            return None
+        track_y = self.ruler_height + track_idx * self.track_height
+        padding = 4
+        x1 = self.header_width + float(clip['start']) * self.pixels_per_second
+        x2 = self.header_width + float(clip['start'] + clip['duration']) * self.pixels_per_second
+        y1 = track_y + padding
+        y2 = track_y + self.track_height - padding
+        return (x1, y1, x2, y2)
+
+    def _hit_test_clip(self, x: int, y: int) -> Optional[tuple]:
+        """Return (track_idx, clip, part) where part is move/trim_start/trim_end."""
+        for track_idx, track in enumerate(self.tracks):
+            for clip in track.get('clips', []):
+                rect = self._clip_rect(clip, track_idx)
+                if not rect:
+                    continue
+                x1, y1, x2, y2 = rect
+                if x1 <= x <= x2 and y1 <= y <= y2:
+                    if (x - x1) <= self._clip_edge_px and (x2 - x1) >= (self._clip_edge_px * 2):
+                        return (track_idx, clip, 'trim_start')
+                    if (x2 - x) <= self._clip_edge_px and (x2 - x1) >= (self._clip_edge_px * 2):
+                        return (track_idx, clip, 'trim_end')
+                    return (track_idx, clip, 'move')
+        return None
+
+    def _apply_drag(self, x: int, y: int):
+        state = self._drag_state
+        if not state:
+            return
+
+        clip = state['clip']
+        mode = state['mode']
+        track_idx = state['track_idx']
+
+        if mode == 'move':
+            new_track_idx = self._track_index_at_y(y)
+            if new_track_idx is not None and new_track_idx != track_idx:
+                old_track = self.tracks[track_idx]
+                new_track = self.tracks[new_track_idx]
+                if clip in old_track.get('clips', []):
+                    old_track['clips'].remove(clip)
+                new_track.setdefault('clips', []).append(clip)
+                state['track_idx'] = new_track_idx
+                track_idx = new_track_idx
+
+        media_duration = state.get('media_duration')
+
+        if mode == 'move':
+            new_start = (float(x) - self.header_width - float(state['grab_offset_x'])) / self.pixels_per_second
+            clip['start'] = max(0.0, new_start)
+
+        elif mode == 'trim_start':
+            original_start = float(state['start_time'])
+            original_duration = float(state['duration'])
+            original_source_start = float(state['source_start'])
+            original_source_end = original_source_start + original_duration
+            original_end = original_start + original_duration
+
+            earliest_start = max(0.0, original_start - original_source_start)
+            latest_start = max(0.0, original_end - self._min_clip_duration)
+
+            proposed_start = (float(x) - self.header_width) / self.pixels_per_second
+            proposed_start = max(earliest_start, min(proposed_start, latest_start))
+
+            new_duration = max(self._min_clip_duration, original_end - proposed_start)
+            new_source_start = original_source_end - new_duration
+
+            if media_duration is not None:
+                new_source_start = max(0.0, min(float(media_duration), float(new_source_start)))
+                max_duration = max(self._min_clip_duration, float(media_duration) - new_source_start)
+                new_duration = min(new_duration, max_duration)
+                proposed_start = original_end - new_duration
+
+            clip['start'] = max(0.0, proposed_start)
+            clip['duration'] = max(self._min_clip_duration, new_duration)
+            clip['source_start'] = max(0.0, new_source_start)
+
+        elif mode == 'trim_end':
+            original_start = float(state['start_time'])
+            original_source_start = float(state['source_start'])
+
+            proposed_end = (float(x) - self.header_width) / self.pixels_per_second
+            proposed_end = max(original_start + self._min_clip_duration, proposed_end)
+
+            new_duration = proposed_end - original_start
+
+            if media_duration is not None:
+                max_duration = max(self._min_clip_duration, float(media_duration) - float(original_source_start))
+                new_duration = min(new_duration, max_duration)
+
+            clip['duration'] = max(self._min_clip_duration, new_duration)
+
+        self._draw()
+
+    def _sort_all_tracks(self):
+        for track in self.tracks:
+            clips = track.get('clips', [])
+            if clips:
+                clips.sort(key=lambda c: float(c.get('start', 0.0)))
 
     def set_playhead(self, position: float):
         self.playhead_position = max(0, min(position, self.duration))
@@ -702,6 +977,8 @@ class TimelineCanvas(tk.Canvas):
         """Draw a media clip on the track with waveform."""
         start_x = self.header_width + int(clip['start'] * self.pixels_per_second)
         end_x = self.header_width + int((clip['start'] + clip['duration']) * self.pixels_per_second)
+        if end_x <= start_x + 2:
+            end_x = start_x + 2
         clip_width = end_x - start_x
 
         # Clip rectangle (darker background for waveform contrast)
@@ -711,17 +988,24 @@ class TimelineCanvas(tk.Canvas):
         clip_height = clip_y2 - clip_y1
 
         is_loading = clip.get('loading', False)
+        is_selected = clip is self.selected_clip
 
         # Draw clip background
         if is_loading:
             bg_color = '#333333'  # Gray for loading
             outline_color = '#666666'
+            outline_width = 1
         else:
             bg_color = self._darken_color(track['color'], 0.3)
-            outline_color = track['color']
+            outline_color = '#ffffff' if is_selected else track['color']
+            outline_width = 2 if is_selected else 1
 
         self.create_rectangle(start_x + 1, clip_y1, end_x - 1, clip_y2,
-                            fill=bg_color, outline=outline_color, width=1)
+                            fill=bg_color, outline=outline_color, width=outline_width)
+
+        if is_selected and not is_loading and clip_width >= 12:
+            self.create_line(start_x + 2, clip_y1, start_x + 2, clip_y2, fill='#ffffff')
+            self.create_line(end_x - 2, clip_y1, end_x - 2, clip_y2, fill='#ffffff')
 
         # Draw waveform if audio engine available and clip has audio (not loading)
         if not is_loading and self.audio_engine and clip.get('path') and clip_width > 10:
@@ -757,8 +1041,16 @@ class TimelineCanvas(tk.Canvas):
         if not filepath or clip_width < 10:
             return
 
-        # Get waveform data (20 points per second from overview)
-        waveform = self.audio_engine.get_waveform(filepath, clip_width)
+        source_start = float(clip.get('source_start', 0.0))
+        duration = float(clip.get('duration', 0.0))
+        cache_key = (filepath, int(clip_width), round(source_start, 3), round(duration, 3))
+
+        waveform = self._waveform_cache.get(cache_key)
+        if waveform is None:
+            waveform = self.audio_engine.get_waveform_segment(filepath, clip_width, source_start, duration)
+            if waveform:
+                self._waveform_cache[cache_key] = waveform
+
         if not waveform or len(waveform) < 2:
             return
 
@@ -993,6 +1285,7 @@ class WaveSyncApp:
         self.timeline.pack(fill='both', expand=True, padx=4, pady=4)
         self.timeline.on_playhead_change = self._on_playhead_change
         self.timeline.on_track_add_media = self._on_track_add_media
+        self.timeline.on_timeline_edited = self._on_timeline_edited
         self.timeline.audio_engine = self.audio_engine  # Connect for waveform display
 
         # Status bar
@@ -1049,6 +1342,25 @@ class WaveSyncApp:
         self._update_time_display()
         self._update_preview_for_time(position)
 
+    def _on_timeline_edited(self):
+        max_end = 0.0
+        for track in self.timeline.tracks:
+            for clip in track.get('clips', []):
+                if clip.get('loading'):
+                    continue
+                try:
+                    end_time = float(clip.get('start', 0.0)) + float(clip.get('duration', 0.0))
+                except Exception:
+                    continue
+                max_end = max(max_end, end_time)
+
+        if max_end + 10 > self.project_duration:
+            self.project_duration = max_end + 10
+            self.timeline.duration = self.project_duration
+
+        self._update_time_display()
+        self._update_preview_for_time(self.playhead_position)
+
     def _update_preview_for_time(self, time: float):
         """Update preview image for the given time position."""
         # Find video clip at current time
@@ -1056,7 +1368,7 @@ class WaveSyncApp:
             if track['type'] == 'video':
                 for clip in track.get('clips', []):
                     if clip['start'] <= time < clip['start'] + clip['duration']:
-                        clip_time = time - clip['start']
+                        clip_time = (time - clip['start']) + float(clip.get('source_start', 0.0))
                         self._show_video_frame(clip['path'], clip_time)
                         return
 
@@ -1084,6 +1396,13 @@ class WaveSyncApp:
         else:
             self._play()
 
+    def _get_audible_tracks(self) -> list:
+        tracks = list(self.timeline.tracks)
+        soloed = [t for t in tracks if t.get('solo') and not t.get('muted')]
+        if soloed:
+            return soloed
+        return [t for t in tracks if not t.get('muted')]
+
     def _play(self):
         """Start playback."""
         self.is_playing = True
@@ -1092,10 +1411,10 @@ class WaveSyncApp:
 
         # Collect all audio clips from all tracks
         all_clips = []
-        for track in self.timeline.tracks:
-            if track['muted']:
-                continue
+        for track in self._get_audible_tracks():
             for clip in track.get('clips', []):
+                if clip.get('loading'):
+                    continue
                 all_clips.append(clip)
 
         # Set clips and start playback
@@ -1107,10 +1426,10 @@ class WaveSyncApp:
     def _get_clips_at_time(self, time: float) -> list:
         """Get all clips that are active at the given time."""
         clips = []
-        for track in self.timeline.tracks:
-            if track['muted']:
-                continue
+        for track in self._get_audible_tracks():
             for clip in track.get('clips', []):
+                if clip.get('loading'):
+                    continue
                 if clip['start'] <= time < clip['start'] + clip['duration']:
                     clip_with_type = clip.copy()
                     clip_with_type['type'] = track['type']
@@ -1247,6 +1566,8 @@ class WaveSyncApp:
                 'path': filepath,
                 'start': start_time,
                 'duration': 10.0,  # Placeholder duration
+                'source_start': 0.0,
+                'media_duration': None,
                 'loading': True,
             }
             track['clips'].append(clip)
@@ -1266,6 +1587,8 @@ class WaveSyncApp:
             duration = loaded.duration
             clip['name'] = filename
             clip['duration'] = duration
+            clip['source_start'] = float(clip.get('source_start', 0.0))
+            clip['media_duration'] = float(duration)
             clip['loading'] = False
 
             # Update project duration if needed
@@ -1293,11 +1616,131 @@ class WaveSyncApp:
     def _on_export(self):
         filepath = filedialog.asksaveasfilename(
             title="Export",
-            defaultextension=".mp4",
+            defaultextension=".wav",
             filetypes=[("MP4 Video", "*.mp4"), ("WAV Audio", "*.wav"), ("All Files", "*.*")]
         )
-        if filepath:
-            self.status_label.config(text=f"Exporting to: {os.path.basename(filepath)}")
+        if not filepath:
+            return
+
+        root, ext = os.path.splitext(filepath)
+        ext = ext.lower()
+        if not ext:
+            filepath = filepath + ".wav"
+            ext = ".wav"
+
+        if ext != ".wav":
+            messagebox.showinfo("Export", "Only WAV export is currently supported.")
+            return
+
+        self._export_wav(filepath)
+
+    def _export_wav(self, filepath: str):
+        self.status_label.config(text=f"Exporting WAV: {os.path.basename(filepath)}")
+        threading.Thread(target=self._export_wav_worker, args=(filepath,), daemon=True).start()
+
+    def _export_wav_worker(self, filepath: str):
+        try:
+            sample_rate = int(self.audio_engine.sample_rate)
+            channels = int(self.audio_engine.channels)
+
+            clips = []
+            for track in self._get_audible_tracks():
+                for clip in track.get('clips', []):
+                    if clip.get('loading'):
+                        continue
+                    if clip.get('path'):
+                        clips.append(clip)
+
+            if not clips:
+                self.root.after(0, lambda: messagebox.showinfo("Export", "No clips to export."))
+                self.root.after(0, lambda: self.status_label.config(text="Export canceled (no clips)"))
+                return
+
+            clip_specs = []
+            end_time = 0.0
+            for clip in clips:
+                path = clip.get('path')
+                if not path:
+                    continue
+
+                loaded = self.audio_engine.loaded_audio.get(path)
+                if not loaded:
+                    loaded = self.audio_engine.load_audio(path)
+                if not loaded:
+                    continue
+
+                start = float(clip.get('start', 0.0))
+                duration = float(clip.get('duration', 0.0))
+                source_start = float(clip.get('source_start', 0.0))
+
+                if duration <= 0:
+                    continue
+
+                end_time = max(end_time, start + duration)
+
+                clip_specs.append({
+                    'audio': loaded,
+                    'start_frame': int(round(start * sample_rate)),
+                    'duration_frames': int(round(duration * sample_rate)),
+                    'source_start_frame': int(round(source_start * sample_rate)),
+                })
+
+            if not clip_specs or end_time <= 0:
+                self.root.after(0, lambda: messagebox.showinfo("Export", "No audio data to export."))
+                self.root.after(0, lambda: self.status_label.config(text="Export canceled (no audio)"))
+                return
+
+            total_frames = int(math.ceil(end_time * sample_rate))
+            block_size = 8192
+
+            def set_status(text: str):
+                self.root.after(0, lambda t=text: self.status_label.config(text=t))
+
+            with wave.open(filepath, 'wb') as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(2)  # int16 PCM
+                wf.setframerate(sample_rate)
+
+                last_reported = -1
+                for block_start in range(0, total_frames, block_size):
+                    frames = min(block_size, total_frames - block_start)
+                    block_end = block_start + frames
+
+                    mixed = np.zeros((frames, channels), dtype=np.float32)
+
+                    for spec in clip_specs:
+                        clip_start = spec['start_frame']
+                        clip_end = clip_start + spec['duration_frames']
+
+                        overlap_start = max(block_start, clip_start)
+                        overlap_end = min(block_end, clip_end)
+                        if overlap_end <= overlap_start:
+                            continue
+
+                        out_offset = overlap_start - block_start
+                        frames_to_mix = overlap_end - overlap_start
+                        clip_offset = overlap_start - clip_start
+
+                        src_frame = spec['source_start_frame'] + clip_offset
+                        mixed[out_offset:out_offset + frames_to_mix] += spec['audio'].get_samples_by_frame(
+                            src_frame, frames_to_mix
+                        )
+
+                    np.clip(mixed, -1.0, 1.0, out=mixed)
+                    pcm = (mixed * 32767.0).astype(np.int16)
+                    wf.writeframes(pcm.tobytes())
+
+                    percent = int((block_start / max(1, total_frames)) * 100)
+                    if percent != last_reported and percent % 10 == 0:
+                        last_reported = percent
+                        set_status(f"Exporting WAV... {percent}%")
+
+            set_status(f"Exported WAV: {os.path.basename(filepath)}")
+            self.root.after(0, lambda: messagebox.showinfo("Export", f"WAV exported to:\n{filepath}"))
+
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Export Failed", str(e)))
+            self.root.after(0, lambda: self.status_label.config(text="Export failed"))
 
     def _on_split(self):
         self.status_label.config(text=f"Split at {self.playhead_position:.2f}s")
