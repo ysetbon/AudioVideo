@@ -217,6 +217,8 @@ class WaveSyncApp:
         self.timeline.on_timeline_edited = self._on_timeline_edited
         self.timeline.on_zoom_request = self._on_zoom_wheel
         self.timeline.on_clip_select = self._on_clip_select
+        self.timeline.on_add_video_track = self._on_add_video_track
+        self.timeline.on_add_audio_track = self._on_add_audio_track
         self.timeline.audio_engine = self.audio_engine
 
         # Horizontal scrollbar for timeline
@@ -473,6 +475,10 @@ class WaveSyncApp:
         self.play_btn.set_colors(bg_color=Theme.WARNING, hover_color=Theme.WARNING)
         self.status_label.config(text="Playing...")
 
+        # Store the play start position for the dashed marker
+        self.timeline.play_start_position = self.playhead_position
+        self.timeline._draw()  # Redraw to show the dashed start marker
+
         # Collect all audio clips from all tracks
         all_clips = []
         for track in self._get_audible_tracks():
@@ -487,6 +493,7 @@ class WaveSyncApp:
 
         if not self.audio_engine.is_active():
             self.is_playing = False
+            self.timeline.play_start_position = None
             self.play_btn.set_text("▶")
             self.play_btn.set_colors(bg_color=Theme.SUCCESS, hover_color=Theme.SUCCESS_HOVER)
             self.status_label.config(text="Audio output unavailable")
@@ -517,6 +524,12 @@ class WaveSyncApp:
             self.root.after_cancel(self.playback_job)
             self.playback_job = None
 
+        # Return playhead to the original play start position
+        if self.timeline.play_start_position is not None:
+            self._seek_to(self.timeline.play_start_position)
+            self.timeline.play_start_position = None
+            self.timeline._draw()
+
     def _on_stop(self):
         self.is_playing = False
         self.audio_engine.stop()  # Stops and resets position to 0
@@ -525,7 +538,14 @@ class WaveSyncApp:
         if self.playback_job:
             self.root.after_cancel(self.playback_job)
             self.playback_job = None
-        self._seek_to(0)
+
+        # Return playhead to the original play start position (or 0 if none)
+        if self.timeline.play_start_position is not None:
+            self._seek_to(self.timeline.play_start_position)
+            self.timeline.play_start_position = None
+        else:
+            self._seek_to(0)
+        self.timeline._draw()
         self.status_label.config(text="Stopped")
 
     def _on_skip_back(self):

@@ -26,6 +26,8 @@ class TimelineCanvas(tk.Canvas):
         self.on_timeline_edited: Optional[Callable[[], None]] = None
         self.on_zoom_request: Optional[Callable[[int], None]] = None  # delta: positive=zoom in, negative=zoom out
         self.on_scroll_update: Optional[Callable[[float, float], None]] = None  # (scroll_percent, visible_percent)
+        self.on_add_video_track: Optional[Callable[[], None]] = None
+        self.on_add_audio_track: Optional[Callable[[], None]] = None
 
         # Horizontal scroll offset (in pixels)
         self.scroll_offset = 0
@@ -34,6 +36,9 @@ class TimelineCanvas(tk.Canvas):
         self._playhead_line_id: Optional[int] = None
         self._playhead_handle_id: Optional[int] = None
         self._drag_playhead = False
+
+        # Play start marker (dashed line showing where play started)
+        self.play_start_position: Optional[float] = None  # None when not playing
 
         # Track configuration
         self.track_height = 80  # default track height (px)
@@ -62,6 +67,9 @@ class TimelineCanvas(tk.Canvas):
         self._hover_clip: Optional[dict] = None
         self._hover_part: Optional[str] = None
 
+        # Track reorder state
+        self._track_drag_insert_idx: Optional[int] = None
+
         self._clip_edge_px = 8
         self._min_clip_duration = 0.05  # seconds
         self._fade_handle_radius = 5
@@ -82,6 +90,8 @@ class TimelineCanvas(tk.Canvas):
         self.bind('<MouseWheel>', self._on_mousewheel)
         self.bind('<Button-4>', self._on_mousewheel_linux)  # Linux scroll up
         self.bind('<Button-5>', self._on_mousewheel_linux)  # Linux scroll down
+        # Right-click context menu for track panel
+        self.bind('<Button-3>', self._on_right_click)
 
         self._draw()
 
@@ -172,7 +182,7 @@ class TimelineCanvas(tk.Canvas):
                     self.on_track_add_media(track_idx, self.tracks[track_idx])
                 return
 
-        # Track M/S buttons
+        # Track M/S buttons and track label drag
         track_idx = self._track_index_at_y(event.y)
         if track_idx is not None and event.x < self.header_width:
             bounds = self._track_bounds(track_idx)
@@ -190,6 +200,18 @@ class TimelineCanvas(tk.Canvas):
                 self._draw()
                 if self.on_timeline_edited:
                     self.on_timeline_edited()
+                return
+
+            # Click on track label area (upper part, above buttons) - start track reorder drag
+            if event.y < (track_y1 + 45):
+                self._drag_state = {
+                    'mode': 'reorder_track',
+                    'track_idx': track_idx,
+                    'start_y': event.y,
+                }
+                self._track_drag_insert_idx = track_idx
+                self.config(cursor='fleur')
+                self._draw()
                 return
 
         # Clip selection / drag begin
@@ -263,6 +285,8 @@ class TimelineCanvas(tk.Canvas):
         if self._drag_state:
             if self._drag_state.get('mode') == 'resize_track':
                 self._apply_track_resize(event.y)
+            elif self._drag_state.get('mode') == 'reorder_track':
+                self._apply_track_reorder(event.y)
             else:
                 self._apply_drag(event.x, event.y)
             return
@@ -281,6 +305,16 @@ class TimelineCanvas(tk.Canvas):
             self._drag_state = None
             self._recompute_track_layout()
             self._draw()
+            return
+        if self._drag_state.get('mode') == 'reorder_track':
+            self._finalize_track_reorder()
+            self._drag_state = None
+            self._track_drag_insert_idx = None
+            self.config(cursor='')
+            self._recompute_track_layout()
+            self._draw()
+            if self.on_timeline_edited:
+                self.on_timeline_edited()
             return
         self._drag_state = None
         self._sort_all_tracks()
@@ -308,6 +342,38 @@ class TimelineCanvas(tk.Canvas):
             delta = 1 if event.num == 4 else -1
             self.on_zoom_request(delta)
 
+    def _on_right_click(self, event):
+        """Handle right-click for context menu in track labels panel."""
+        # Only show menu if clicking in the track labels area (left panel)
+        if event.x >= self.header_width:
+            return
+
+        # Check if clicking on an existing track's label area
+        track_idx = self._track_index_at_y(event.y)
+        if track_idx is not None:
+            # Clicked on an existing track - could add track-specific menu later
+            return
+
+        # Clicked on empty area below tracks or in header - show add track menu
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Add Video Track", command=self._menu_add_video_track)
+        menu.add_command(label="Add Audio Track", command=self._menu_add_audio_track)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _menu_add_video_track(self):
+        """Handle add video track from context menu."""
+        if self.on_add_video_track:
+            self.on_add_video_track()
+
+    def _menu_add_audio_track(self):
+        """Handle add audio track from context menu."""
+        if self.on_add_audio_track:
+            self.on_add_audio_track()
+
     def _on_motion(self, event):
         if self._drag_state:
             return
@@ -329,7 +395,7 @@ class TimelineCanvas(tk.Canvas):
                 self.config(cursor='hand2')
                 return
 
-        # Track M/S hover
+        # Track M/S hover and track label drag hover
         track_idx = self._track_index_at_y(event.y)
         if track_idx is not None and event.x < self.header_width:
             bounds = self._track_bounds(track_idx)
@@ -339,6 +405,11 @@ class TimelineCanvas(tk.Canvas):
             if ((12 <= event.x <= 36) or (42 <= event.x <= 66)) and ((track_y1 + 50) <= event.y <= (track_y1 + 70)):
                 self._set_hover_target(None, None)
                 self.config(cursor='hand2')
+                return
+            # Track label area (upper part) - show move cursor
+            if event.y < (track_y1 + 45):
+                self._set_hover_target(None, None)
+                self.config(cursor='fleur')
                 return
 
         # Clip hover
@@ -377,6 +448,58 @@ class TimelineCanvas(tk.Canvas):
         if self._normalize_track_height(track.get('height', self.track_height)) != new_height:
             track['height'] = new_height
             self._draw()
+
+    def _apply_track_reorder(self, y: int):
+        """Update the insertion index during track reorder drag."""
+        state = self._drag_state
+        if not state or state.get('mode') != 'reorder_track':
+            return
+
+        # Find which track position we're hovering over
+        if len(self._track_layout) != len(self.tracks):
+            self._recompute_track_layout()
+
+        # Determine insertion point based on y position
+        new_insert_idx = len(self.tracks)  # Default: insert at end
+
+        for idx, (y1, y2) in enumerate(self._track_layout):
+            mid_y = (y1 + y2) // 2
+            if y < mid_y:
+                new_insert_idx = idx
+                break
+
+        # Handle y above all tracks
+        if y < self.ruler_height:
+            new_insert_idx = 0
+
+        if new_insert_idx != self._track_drag_insert_idx:
+            self._track_drag_insert_idx = new_insert_idx
+            self._draw()
+
+    def _finalize_track_reorder(self):
+        """Move the dragged track to its new position."""
+        state = self._drag_state
+        if not state or state.get('mode') != 'reorder_track':
+            return
+
+        src_idx = state.get('track_idx')
+        dst_idx = self._track_drag_insert_idx
+
+        if src_idx is None or dst_idx is None:
+            return
+        if src_idx == dst_idx or src_idx == dst_idx - 1:
+            # No movement needed
+            return
+
+        # Remove track from source position
+        track = self.tracks.pop(src_idx)
+
+        # Adjust destination index if source was before destination
+        if src_idx < dst_idx:
+            dst_idx -= 1
+
+        # Insert at new position
+        self.tracks.insert(dst_idx, track)
 
     def _track_index_at_y(self, y: int) -> Optional[int]:
         if y < self.ruler_height:
@@ -692,12 +815,38 @@ class TimelineCanvas(tk.Canvas):
 
         # Draw tracks
         self._recompute_track_layout()
+        dragging_track_idx = None
+        if self._drag_state and self._drag_state.get('mode') == 'reorder_track':
+            dragging_track_idx = self._drag_state.get('track_idx')
+
         for idx, track in enumerate(self.tracks):
             bounds = self._track_bounds(idx)
             if not bounds:
                 continue
             y1, y2 = bounds
             self._draw_track(track, y1, width, idx, y2 - y1)
+
+            # Highlight the track being dragged
+            if idx == dragging_track_idx:
+                self.create_rectangle(0, y1, width, y2,
+                                     fill='', outline=Theme.PLAYHEAD, width=2)
+
+        # Draw track reorder insertion indicator
+        if self._drag_state and self._drag_state.get('mode') == 'reorder_track' and self._track_drag_insert_idx is not None:
+            insert_y = self.ruler_height
+            if self._track_drag_insert_idx < len(self._track_layout):
+                insert_y = self._track_layout[self._track_drag_insert_idx][0]
+            elif len(self._track_layout) > 0:
+                insert_y = self._track_layout[-1][1]
+
+            # Draw a thick colored line at the insertion point
+            self.create_line(0, insert_y, width, insert_y,
+                            fill=Theme.SUCCESS, width=3)
+            # Draw small triangles on the sides
+            self.create_polygon(0, insert_y - 6, 0, insert_y + 6, 8, insert_y,
+                               fill=Theme.SUCCESS, outline='')
+            self.create_polygon(width, insert_y - 6, width, insert_y + 6, width - 8, insert_y,
+                               fill=Theme.SUCCESS, outline='')
 
         # Draw playhead
         self._draw_playhead(height)
@@ -1066,7 +1215,35 @@ class TimelineCanvas(tk.Canvas):
         return f'#{r:02x}{g:02x}{b:02x}'
 
     def _draw_playhead(self, height):
+        self._draw_play_start_marker(height)
         self._update_playhead_visual(height)
+
+    def _draw_play_start_marker(self, height: int):
+        """Draw dashed line at the position where playback started."""
+        if self.play_start_position is None:
+            return
+
+        x = self.header_width + int(round(self.play_start_position * self.pixels_per_second)) - self.scroll_offset
+
+        # Don't draw if outside visible area
+        if x < self.header_width or x > self.winfo_width():
+            return
+
+        # Use a bright cyan/teal color for visibility
+        marker_color = '#00ffff'
+
+        # Draw dashed vertical line using tkinter's dash option
+        self.create_line(
+            x, self.ruler_height, x, height,
+            fill=marker_color, width=2, dash=(8, 5),
+            tags=('play_start_marker',)
+        )
+
+        # Draw small marker at the top
+        self.create_polygon(
+            x - 6, self.ruler_height - 2, x + 6, self.ruler_height - 2, x, self.ruler_height + 10,
+            fill=marker_color, outline='', tags=('play_start_marker',)
+        )
 
     def _update_playhead_visual(self, height: Optional[int] = None):
         if height is None:
