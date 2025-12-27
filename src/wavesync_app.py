@@ -33,6 +33,8 @@ class WaveSyncApp:
         self.playhead_position = 0.0
         self.project_duration = 180.0
         self.selected_clip = None
+        self.selected_track_idx = None
+        self.clipboard_clip = None  # For copy/paste
 
         # Audio engine (loads audio into memory like Audacity)
         self.audio_engine = AudioEngine()
@@ -96,12 +98,16 @@ class WaveSyncApp:
         file_menu.add_separator()
         file_menu.add_command(label="Import Media...", accelerator="Ctrl+I", command=self._on_import)
         file_menu.add_command(label="Export...", accelerator="Ctrl+E", command=self._on_export)
+        file_menu.add_command(label="Export Audio Only...", command=self._on_export_audio_only)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", accelerator="Alt+F4", command=self._on_close)
 
         edit_menu = create_menu(menubar, "Edit")
         edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", state='disabled')
         edit_menu.add_command(label="Redo", accelerator="Ctrl+Y", state='disabled')
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Copy", accelerator="Ctrl+C", command=self._on_copy)
+        edit_menu.add_command(label="Paste", accelerator="Ctrl+V", command=self._on_paste)
         edit_menu.add_separator()
         edit_menu.add_command(label="Split at Playhead", accelerator="S", command=self._on_split)
 
@@ -262,6 +268,10 @@ class WaveSyncApp:
         self.root.bind('<Control-O>', lambda e: self._on_open())
         self.root.bind('<Control-n>', lambda e: self._on_new())
         self.root.bind('<Control-N>', lambda e: self._on_new())
+        self.root.bind('<Control-c>', lambda e: self._on_copy())
+        self.root.bind('<Control-C>', lambda e: self._on_copy())
+        self.root.bind('<Control-v>', lambda e: self._on_paste())
+        self.root.bind('<Control-V>', lambda e: self._on_paste())
         self.root.bind('<s>', lambda e: self._on_split())
         self.root.bind('<F1>', lambda e: self._on_shortcuts())
 
@@ -438,6 +448,7 @@ class WaveSyncApp:
     def _on_clip_select(self, clip, track_idx):
         """Handle clip selection."""
         self.selected_clip = clip
+        self.selected_track_idx = track_idx
         if not clip:
             self.props_label.config(text="No clip selected")
             return
@@ -726,19 +737,42 @@ class WaveSyncApp:
             messagebox.showinfo("Export", "Only WAV export is currently supported.")
             return
 
-        self._export_wav(filepath)
+        self._export_wav(filepath, audio_only=False)
 
-    def _export_wav(self, filepath: str):
-        self.status_label.config(text=f"Exporting WAV: {os.path.basename(filepath)}")
-        threading.Thread(target=self._export_wav_worker, args=(filepath,), daemon=True).start()
+    def _on_export_audio_only(self):
+        """Export only audio tracks to WAV file."""
+        filepath = filedialog.asksaveasfilename(
+            title="Export Audio Only",
+            defaultextension=".wav",
+            filetypes=[("WAV Audio", "*.wav"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return
 
-    def _export_wav_worker(self, filepath: str):
+        root, ext = os.path.splitext(filepath)
+        ext = ext.lower()
+        if not ext:
+            filepath = filepath + ".wav"
+
+        self._export_wav(filepath, audio_only=True)
+
+    def _export_wav(self, filepath: str, audio_only: bool = False):
+        mode = "Audio Only" if audio_only else "WAV"
+        self.status_label.config(text=f"Exporting {mode}: {os.path.basename(filepath)}")
+        threading.Thread(target=self._export_wav_worker, args=(filepath, audio_only), daemon=True).start()
+
+    def _export_wav_worker(self, filepath: str, audio_only: bool = False):
         try:
             sample_rate = int(self.audio_engine.sample_rate)
             channels = int(self.audio_engine.channels)
 
+            # Get tracks to export
+            tracks_to_export = self._get_audible_tracks()
+            if audio_only:
+                tracks_to_export = [t for t in tracks_to_export if t.get('type') == 'audio']
+
             clips = []
-            for track in self._get_audible_tracks():
+            for track in tracks_to_export:
                 for clip in track.get('clips', []):
                     if clip.get('loading'):
                         continue
@@ -746,7 +780,8 @@ class WaveSyncApp:
                         clips.append(clip)
 
             if not clips:
-                self.root.after(0, lambda: messagebox.showinfo("Export", "No clips to export."))
+                msg = "No audio track clips to export." if audio_only else "No clips to export."
+                self.root.after(0, lambda m=msg: messagebox.showinfo("Export", m))
                 self.root.after(0, lambda: self.status_label.config(text="Export canceled (no clips)"))
                 return
 
@@ -868,10 +903,66 @@ class WaveSyncApp:
     def _on_split(self):
         self.status_label.config(text=f"Split at {self.playhead_position:.2f}s")
 
+    def _on_copy(self):
+        """Copy the selected clip to clipboard."""
+        if not self.selected_clip:
+            self.status_label.config(text="No clip selected to copy")
+            return
+
+        # Store a deep copy of the clip with all properties
+        self.clipboard_clip = {
+            'name': self.selected_clip.get('name', 'Untitled'),
+            'path': self.selected_clip.get('path'),
+            'duration': self.selected_clip.get('duration', 0.0),
+            'source_start': self.selected_clip.get('source_start', 0.0),
+            'media_duration': self.selected_clip.get('media_duration'),
+            'fade_in': self.selected_clip.get('fade_in', 0.0),
+            'fade_out': self.selected_clip.get('fade_out', 0.0),
+            'fade_in_curve': self.selected_clip.get('fade_in_curve', 0.0),
+            'fade_out_curve': self.selected_clip.get('fade_out_curve', 0.0),
+            'track_idx': self.selected_track_idx,
+        }
+        self.status_label.config(text=f"Copied: {self.clipboard_clip['name']}")
+
+    def _on_paste(self):
+        """Paste the clipboard clip at playhead position."""
+        if not self.clipboard_clip:
+            self.status_label.config(text="Nothing to paste")
+            return
+
+        # Determine target track
+        track_idx = self.clipboard_clip.get('track_idx', 0)
+        if track_idx is None or track_idx >= len(self.timeline.tracks):
+            track_idx = 0
+
+        track = self.timeline.tracks[track_idx]
+
+        # Create new clip at playhead position
+        new_clip = {
+            'name': self.clipboard_clip['name'],
+            'path': self.clipboard_clip['path'],
+            'start': self.playhead_position,
+            'duration': self.clipboard_clip['duration'],
+            'source_start': self.clipboard_clip['source_start'],
+            'fade_in': self.clipboard_clip['fade_in'],
+            'fade_out': self.clipboard_clip['fade_out'],
+            'fade_in_curve': self.clipboard_clip['fade_in_curve'],
+            'fade_out_curve': self.clipboard_clip['fade_out_curve'],
+            'loading': False,
+        }
+
+        # Preserve media_duration so clip can be untrimmed/expanded
+        if self.clipboard_clip.get('media_duration') is not None:
+            new_clip['media_duration'] = self.clipboard_clip['media_duration']
+
+        track['clips'].append(new_clip)
+        self.timeline._draw()
+        self.status_label.config(text=f"Pasted: {new_clip['name']} at {self.playhead_position:.2f}s")
+
     def _on_add_video_track(self):
         num = len([t for t in self.timeline.tracks if t['type'] == 'video']) + 1
         self.timeline.tracks.append({
-            'name': f'V{num}', 'type': 'video', 'color': Theme.TRACK_VIDEO, 'muted': False, 'solo': False, 'clips': []
+            'name': f'V{num}', 'type': 'video', 'color': Theme.TRACK_VIDEO, 'muted': False, 'solo': False, 'clips': [], 'height': self.timeline.track_height
         })
         self.timeline._draw()
         self.status_label.config(text=f"Added video track V{num}")
@@ -883,7 +974,7 @@ class WaveSyncApp:
         color = colors[(num - 1) % len(colors)]
         
         self.timeline.tracks.append({
-            'name': f'A{num}', 'type': 'audio', 'color': color, 'muted': False, 'solo': False, 'clips': []
+            'name': f'A{num}', 'type': 'audio', 'color': color, 'muted': False, 'solo': False, 'clips': [], 'height': self.timeline.track_height
         })
         self.timeline._draw()
         self.status_label.config(text=f"Added audio track A{num}")
@@ -897,6 +988,8 @@ PLAYBACK:
   Home / End - Go to start/end
 
 EDITING:
+  Ctrl+C - Copy selected clip
+  Ctrl+V - Paste at playhead
   S - Split at playhead
   Ctrl+I - Import media
   Ctrl+S - Save project

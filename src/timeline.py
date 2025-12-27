@@ -36,9 +36,13 @@ class TimelineCanvas(tk.Canvas):
         self._drag_playhead = False
 
         # Track configuration
-        self.track_height = 80
+        self.track_height = 80  # default track height (px)
+        self.min_track_height = 80
+        self.max_track_height = 260
         self.header_width = 150
         self.ruler_height = 30
+        self._track_resize_grab_px = 5
+        self._track_layout: list[tuple[int, int]] = []  # (y1, y2) per track
 
         # Button hit areas (track_index -> (x1, y1, x2, y2))
         self._add_buttons = {}
@@ -55,6 +59,8 @@ class TimelineCanvas(tk.Canvas):
         # Selection / editing state
         self.selected_clip: Optional[dict] = None
         self._drag_state: Optional[dict] = None
+        self._hover_clip: Optional[dict] = None
+        self._hover_part: Optional[str] = None
 
         self._clip_edge_px = 8
         self._min_clip_duration = 0.05  # seconds
@@ -66,10 +72,12 @@ class TimelineCanvas(tk.Canvas):
 
         # Bindings
         self.bind('<Button-1>', self._on_click)
+        self.bind('<Double-Button-1>', self._on_double_click)
         self.bind('<B1-Motion>', self._on_drag)
         self.bind('<ButtonRelease-1>', self._on_release)
         self.bind('<Configure>', self._on_resize)
         self.bind('<Motion>', self._on_motion)
+        self.bind('<Leave>', self._on_leave)
         # Mouse wheel zoom (Windows and Linux)
         self.bind('<MouseWheel>', self._on_mousewheel)
         self.bind('<Button-4>', self._on_mousewheel_linux)  # Linux scroll up
@@ -77,15 +85,85 @@ class TimelineCanvas(tk.Canvas):
 
         self._draw()
 
+    def _set_hover_target(self, clip: Optional[dict], part: Optional[str]):
+        if clip is self._hover_clip and part == self._hover_part:
+            return
+        self._hover_clip = clip
+        self._hover_part = part
+        self._draw()
+
+    def _on_leave(self, event):
+        if self._drag_state:
+            return
+        self._set_hover_target(None, None)
+        self.config(cursor='')
+
     def _create_default_tracks(self):
         self.tracks = [
-            {'name': 'V1', 'type': 'video', 'color': Theme.TRACK_VIDEO, 'muted': False, 'solo': False, 'clips': []},
-            {'name': 'A1', 'type': 'audio', 'color': Theme.TRACK_AUDIO_1, 'muted': False, 'solo': False, 'clips': []},
-            {'name': 'A2', 'type': 'audio', 'color': Theme.TRACK_AUDIO_2, 'muted': False, 'solo': False, 'clips': []},
+            {'name': 'V1', 'type': 'video', 'color': Theme.TRACK_VIDEO, 'muted': False, 'solo': False, 'clips': [], 'height': self.track_height},
+            {'name': 'A1', 'type': 'audio', 'color': Theme.TRACK_AUDIO_1, 'muted': False, 'solo': False, 'clips': [], 'height': self.track_height},
+            {'name': 'A2', 'type': 'audio', 'color': Theme.TRACK_AUDIO_2, 'muted': False, 'solo': False, 'clips': [], 'height': self.track_height},
         ]
+        self._recompute_track_layout()
+
+    def _normalize_track_height(self, value) -> int:
+        try:
+            height = int(round(float(value)))
+        except Exception:
+            height = int(self.track_height)
+        return max(int(self.min_track_height), min(int(self.max_track_height), int(height)))
+
+    def _ensure_track_heights(self):
+        for track in self.tracks:
+            if 'height' not in track:
+                track['height'] = self.track_height
+            track['height'] = self._normalize_track_height(track.get('height'))
+
+    def _recompute_track_layout(self):
+        self._ensure_track_heights()
+        y = int(self.ruler_height)
+        layout: list[tuple[int, int]] = []
+        for track in self.tracks:
+            h = self._normalize_track_height(track.get('height'))
+            layout.append((y, y + h))
+            y += h
+        self._track_layout = layout
+
+    def _track_bounds(self, track_idx: int) -> Optional[tuple[int, int]]:
+        if len(self._track_layout) != len(self.tracks):
+            self._recompute_track_layout()
+        if 0 <= track_idx < len(self._track_layout):
+            return self._track_layout[track_idx]
+        return None
+
+    def _hit_test_track_resize(self, x: int, y: int) -> Optional[int]:
+        if x > self.header_width:
+            return None
+        if len(self._track_layout) != len(self.tracks):
+            self._recompute_track_layout()
+        grab = int(self._track_resize_grab_px)
+        for idx, (_y1, y2) in enumerate(self._track_layout):
+            if abs(int(y) - int(y2)) <= grab:
+                return idx
+        return None
 
     def _on_click(self, event):
         self._drag_playhead = False
+
+        # Track height resize (drag the bottom edge of a track header)
+        resize_idx = self._hit_test_track_resize(event.x, event.y)
+        if resize_idx is not None:
+            bounds = self._track_bounds(resize_idx)
+            if bounds:
+                track = self.tracks[resize_idx]
+                self._drag_state = {
+                    'mode': 'resize_track',
+                    'track_idx': resize_idx,
+                    'start_y': int(event.y),
+                    'start_height': self._normalize_track_height(track.get('height', self.track_height)),
+                }
+                self.config(cursor='sb_v_double_arrow')
+                return
 
         # Check if click is on an add button
         for track_idx, (x1, y1, x2, y2) in self._add_buttons.items():
@@ -97,14 +175,17 @@ class TimelineCanvas(tk.Canvas):
         # Track M/S buttons
         track_idx = self._track_index_at_y(event.y)
         if track_idx is not None and event.x < self.header_width:
-            track_y = self.ruler_height + track_idx * self.track_height
-            if 12 <= event.x <= 36 and (track_y + 50) <= event.y <= (track_y + 70):
+            bounds = self._track_bounds(track_idx)
+            if not bounds:
+                return
+            track_y1, _track_y2 = bounds
+            if 12 <= event.x <= 36 and (track_y1 + 50) <= event.y <= (track_y1 + 70):
                 self.tracks[track_idx]['muted'] = not self.tracks[track_idx].get('muted', False)
                 self._draw()
                 if self.on_timeline_edited:
                     self.on_timeline_edited()
                 return
-            if 42 <= event.x <= 66 and (track_y + 50) <= event.y <= (track_y + 70):
+            if 42 <= event.x <= 66 and (track_y1 + 50) <= event.y <= (track_y1 + 70):
                 self.tracks[track_idx]['solo'] = not self.tracks[track_idx].get('solo', False)
                 self._draw()
                 if self.on_timeline_edited:
@@ -169,9 +250,21 @@ class TimelineCanvas(tk.Canvas):
                 self.on_playhead_change(self.playhead_position)
             self._drag_playhead = True
 
+    def _on_double_click(self, event):
+        resize_idx = self._hit_test_track_resize(event.x, event.y)
+        if resize_idx is None:
+            return
+        if 0 <= resize_idx < len(self.tracks):
+            self.tracks[resize_idx]['height'] = self.track_height
+            self._drag_state = None
+            self._draw()
+
     def _on_drag(self, event):
         if self._drag_state:
-            self._apply_drag(event.x, event.y)
+            if self._drag_state.get('mode') == 'resize_track':
+                self._apply_track_resize(event.y)
+            else:
+                self._apply_drag(event.x, event.y)
             return
 
         if self._drag_playhead and event.x > self.header_width:
@@ -183,6 +276,11 @@ class TimelineCanvas(tk.Canvas):
     def _on_release(self, event):
         self._drag_playhead = False
         if not self._drag_state:
+            return
+        if self._drag_state.get('mode') == 'resize_track':
+            self._drag_state = None
+            self._recompute_track_layout()
+            self._draw()
             return
         self._drag_state = None
         self._sort_all_tracks()
@@ -215,26 +313,38 @@ class TimelineCanvas(tk.Canvas):
             return
 
         cursor = ''
+        hover_clip = None
+        hover_part = None
+
+        resize_idx = self._hit_test_track_resize(event.x, event.y)
+        if resize_idx is not None:
+            self._set_hover_target(None, None)
+            self.config(cursor='sb_v_double_arrow')
+            return
 
         # Add button hover
         for track_idx, (x1, y1, x2, y2) in self._add_buttons.items():
             if x1 <= event.x <= x2 and y1 <= event.y <= y2:
-                cursor = 'hand2'
-                self.config(cursor=cursor)
+                self._set_hover_target(None, None)
+                self.config(cursor='hand2')
                 return
 
         # Track M/S hover
         track_idx = self._track_index_at_y(event.y)
         if track_idx is not None and event.x < self.header_width:
-            track_y = self.ruler_height + track_idx * self.track_height
-            if ((12 <= event.x <= 36) or (42 <= event.x <= 66)) and ((track_y + 50) <= event.y <= (track_y + 70)):
+            bounds = self._track_bounds(track_idx)
+            if not bounds:
+                return
+            track_y1, _track_y2 = bounds
+            if ((12 <= event.x <= 36) or (42 <= event.x <= 66)) and ((track_y1 + 50) <= event.y <= (track_y1 + 70)):
+                self._set_hover_target(None, None)
                 self.config(cursor='hand2')
                 return
 
         # Clip hover
         hit = self._hit_test_clip(event.x, event.y)
         if hit:
-            _, _, part = hit
+            _, clip, part = hit
             if part in ('trim_start', 'trim_end', 'fade_in', 'fade_out'):
                 cursor = 'sb_h_double_arrow'
             elif part in ('fade_in_curve', 'fade_out_curve'):
@@ -242,27 +352,55 @@ class TimelineCanvas(tk.Canvas):
             else:
                 cursor = 'fleur'
 
+            if part in ('fade_in', 'fade_out'):
+                hover_clip = clip
+                hover_part = part
+
+        self._set_hover_target(hover_clip, hover_part)
         self.config(cursor=cursor)
+
+    def _apply_track_resize(self, y: int):
+        state = self._drag_state
+        if not state or state.get('mode') != 'resize_track':
+            return
+
+        track_idx = state.get('track_idx')
+        if track_idx is None or not (0 <= int(track_idx) < len(self.tracks)):
+            return
+
+        start_y = int(state.get('start_y', y))
+        start_height = self._normalize_track_height(state.get('start_height', self.track_height))
+        delta = int(y) - int(start_y)
+        new_height = self._normalize_track_height(start_height + delta)
+
+        track = self.tracks[int(track_idx)]
+        if self._normalize_track_height(track.get('height', self.track_height)) != new_height:
+            track['height'] = new_height
+            self._draw()
 
     def _track_index_at_y(self, y: int) -> Optional[int]:
         if y < self.ruler_height:
             return None
-        rel = y - self.ruler_height
-        idx = int(rel // self.track_height)
-        if 0 <= idx < len(self.tracks):
-            return idx
+        if len(self._track_layout) != len(self.tracks):
+            self._recompute_track_layout()
+        for idx, (y1, y2) in enumerate(self._track_layout):
+            if y1 <= int(y) < y2:
+                return idx
         return None
 
     def _clip_rect(self, clip: dict, track_idx: int) -> Optional[tuple]:
         """Return (x1, y1, x2, y2) in canvas coords for a clip."""
         if 'start' not in clip or 'duration' not in clip:
             return None
-        track_y = self.ruler_height + track_idx * self.track_height
+        bounds = self._track_bounds(track_idx)
+        if not bounds:
+            return None
+        track_y1, track_y2 = bounds
         padding = 4
         x1 = self.header_width + float(clip['start']) * self.pixels_per_second - self.scroll_offset
         x2 = self.header_width + float(clip['start'] + clip['duration']) * self.pixels_per_second - self.scroll_offset
-        y1 = track_y + padding
-        y2 = track_y + self.track_height - padding
+        y1 = track_y1 + padding
+        y2 = track_y2 - padding
         return (x1, y1, x2, y2)
 
     def _hit_test_clip(self, x: int, y: int) -> Optional[tuple]:
@@ -418,9 +556,12 @@ class TimelineCanvas(tk.Canvas):
                 clip['fade_out_curve'] = max(-5.0, min(5.0, curve))
 
         elif mode == 'fade_in_curve':
-            track_y = self.ruler_height + track_idx * self.track_height
-            clip_y1 = track_y + 4
-            clip_y2 = track_y + self.track_height - 4
+            bounds = self._track_bounds(track_idx)
+            if not bounds:
+                return
+            track_y1, track_y2 = bounds
+            clip_y1 = track_y1 + 4
+            clip_y2 = track_y2 - 4
             line_top = clip_y1 + 2
             line_bottom = clip_y2 - 2
             line_height = max(1, line_bottom - line_top)
@@ -428,9 +569,12 @@ class TimelineCanvas(tk.Canvas):
             clip['fade_in_curve'] = self._curve_from_mid_gain(gain)
 
         elif mode == 'fade_out_curve':
-            track_y = self.ruler_height + track_idx * self.track_height
-            clip_y1 = track_y + 4
-            clip_y2 = track_y + self.track_height - 4
+            bounds = self._track_bounds(track_idx)
+            if not bounds:
+                return
+            track_y1, track_y2 = bounds
+            clip_y1 = track_y1 + 4
+            clip_y2 = track_y2 - 4
             line_top = clip_y1 + 2
             line_bottom = clip_y2 - 2
             line_height = max(1, line_bottom - line_top)
@@ -487,7 +631,17 @@ class TimelineCanvas(tk.Canvas):
         self._update_playhead_visual()
 
     def set_zoom(self, pixels_per_second: int):
+        # Calculate playhead's current screen position (relative to content area)
+        old_pps = self.pixels_per_second
+        playhead_screen_x = self.playhead_position * old_pps - self.scroll_offset
+
+        # Update zoom level
         self.pixels_per_second = max(5, min(1000, pixels_per_second))
+
+        # Adjust scroll offset to keep playhead at same screen position
+        new_scroll_offset = self.playhead_position * self.pixels_per_second - playhead_screen_x
+        self.scroll_offset = int(new_scroll_offset)
+
         self._waveform_cache.clear()  # Clear cache as clip widths change
         self._clamp_scroll_offset()
         self._draw()
@@ -537,10 +691,13 @@ class TimelineCanvas(tk.Canvas):
         self._draw_ruler(width)
 
         # Draw tracks
-        y = self.ruler_height
+        self._recompute_track_layout()
         for idx, track in enumerate(self.tracks):
-            self._draw_track(track, y, width, idx)
-            y += self.track_height
+            bounds = self._track_bounds(idx)
+            if not bounds:
+                continue
+            y1, y2 = bounds
+            self._draw_track(track, y1, width, idx, y2 - y1)
 
         # Draw playhead
         self._draw_playhead(height)
@@ -591,13 +748,13 @@ class TimelineCanvas(tk.Canvas):
 
             t += minor
 
-    def _draw_track(self, track, y, width, track_idx):
+    def _draw_track(self, track, y, width, track_idx, track_height: int):
         # Track header
-        self.create_rectangle(0, y, self.header_width, y + self.track_height,
+        self.create_rectangle(0, y, self.header_width, y + track_height,
                             fill=Theme.BG_PANEL, outline='')
 
         # Color indicator
-        self.create_rectangle(0, y, 4, y + self.track_height, fill=track['color'], outline='')
+        self.create_rectangle(0, y, 4, y + track_height, fill=track['color'], outline='')
 
         # Track name
         self.create_text(12, y + 12, text=track['name'], anchor='w',
@@ -624,7 +781,7 @@ class TimelineCanvas(tk.Canvas):
         self._add_buttons[track_idx] = (btn_x1, btn_y1, btn_x2, btn_y2)
 
         # Track content area
-        self.create_rectangle(self.header_width, y, width, y + self.track_height,
+        self.create_rectangle(self.header_width, y, width, y + track_height,
                             fill=Theme.BG_MAIN, outline='')
 
         # Grid lines
@@ -637,24 +794,24 @@ class TimelineCanvas(tk.Canvas):
             if x > width:
                 break
             if x >= self.header_width:
-                self.create_line(x, y, x, y + self.track_height, fill=Theme.BG_HOVER)
+                self.create_line(x, y, x, y + track_height, fill=Theme.BG_HOVER)
             t += major
 
         # Draw clips if any
         for clip in track.get('clips', []):
-            self._draw_clip(clip, track, y, width)
+            self._draw_clip(clip, track, y, width, track_height)
 
         # Bottom border
-        self.create_line(0, y + self.track_height - 1, width, y + self.track_height - 1, fill=Theme.BORDER)
+        self.create_line(0, y + track_height - 1, width, y + track_height - 1, fill=Theme.BORDER)
 
         # "Drop media" hint (only if no clips)
         if not track.get('clips'):
             center_x = self.header_width + (width - self.header_width) // 2
-            center_y = y + self.track_height // 2
+            center_y = y + track_height // 2
             self.create_text(center_x, center_y, text="Click + to add media",
                             fill=Theme.FG_DISABLED, font=('Segoe UI', 10))
 
-    def _draw_clip(self, clip, track, y, width):
+    def _draw_clip(self, clip, track, y, width, track_height: int):
         """Draw a media clip on the track with waveform."""
         start_x = self.header_width + int(clip['start'] * self.pixels_per_second) - self.scroll_offset
         end_x = self.header_width + int((clip['start'] + clip['duration']) * self.pixels_per_second) - self.scroll_offset
@@ -669,7 +826,7 @@ class TimelineCanvas(tk.Canvas):
         # Clip rectangle (darker background for waveform contrast)
         padding = 4
         clip_y1 = y + padding
-        clip_y2 = y + self.track_height - padding
+        clip_y2 = y + track_height - padding
         clip_height = clip_y2 - clip_y1
 
         is_loading = clip.get('loading', False)
@@ -701,63 +858,118 @@ class TimelineCanvas(tk.Canvas):
             fade_in = max(0.0, float(clip.get('fade_in', 0.0)))
             fade_out = max(0.0, float(clip.get('fade_out', 0.0)))
 
-            if is_selected or fade_in > 0 or fade_out > 0:
+            is_hovered_fade = self._hover_clip is clip and self._hover_part in ('fade_in', 'fade_out')
+            is_active_fade = (
+                bool(self._drag_state)
+                and self._drag_state.get('clip') is clip
+                and self._drag_state.get('mode') in ('fade_in', 'fade_out')
+            )
+
+            if is_selected or fade_in > 0 or fade_out > 0 or is_hovered_fade or is_active_fade:
                 r = self._fade_handle_radius
                 handle_y = clip_y1 + self._fade_handle_y_offset
                 line_top = clip_y1 + 2
                 line_bottom = clip_y2 - 2
                 line_height = max(1, line_bottom - line_top)
-                curve_r = max(3, r - 2)
+                curve_r = max(4, r - 1)  # Slightly larger control points
 
                 fade_in_x = start_x + int(fade_in * self.pixels_per_second)
                 fade_in_x = max(start_x, min(fade_in_x, end_x))
                 if fade_in > 0:
                     fade_px = max(1, fade_in_x - start_x)
-                    steps = max(4, min(32, fade_px // 8))
+                    # More steps for smoother anti-aliased curve
+                    steps = max(12, min(64, fade_px // 4))
                     curve = clip.get('fade_in_curve', 0.0)
                     points = []
                     for i in range(steps + 1):
                         p = i / steps
                         g = self._curve_gain(p, curve)
-                        x = start_x + int(p * fade_px)
-                        y_pt = int(line_bottom - g * line_height)
+                        x = start_x + (p * fade_px)
+                        y_pt = line_bottom - g * line_height
                         points.extend([x, y_pt])
                     if len(points) >= 4:
-                        self.create_line(points, fill=Theme.PLAYHEAD, width=1, smooth=True)
+                        # Draw shadow for depth
+                        shadow_points = [p + 1 if i % 2 == 1 else p for i, p in enumerate(points)]
+                        self.create_line(shadow_points, fill='#000000', width=3, smooth=True, splinesteps=36)
+                        # Main curve with thicker stroke and high spline smoothness
+                        self.create_line(points, fill=Theme.PLAYHEAD, width=2, smooth=True, splinesteps=36)
 
                     if is_selected and fade_px >= (curve_r * 4):
                         mid_x = start_x + (fade_px / 2)
                         mid_g = self._curve_gain(0.5, curve)
-                        mid_y = int(line_bottom - mid_g * line_height)
+                        mid_y = line_bottom - mid_g * line_height
+                        # Control point with outline for better visibility
+                        self.create_oval(mid_x - curve_r - 1, mid_y - curve_r - 1, mid_x + curve_r + 1, mid_y + curve_r + 1,
+                                         fill='#000000', outline='')
                         self.create_oval(mid_x - curve_r, mid_y - curve_r, mid_x + curve_r, mid_y + curve_r,
-                                         fill=Theme.PLAYHEAD, outline='')
-                self.create_oval(fade_in_x - r, handle_y - r, fade_in_x + r, handle_y + r,
-                                 fill=Theme.FG_HIGHLIGHT, outline='')
+                                         fill=Theme.PLAYHEAD, outline=Theme.FG_HIGHLIGHT, width=1)
+                fade_in_hovered = self._hover_clip is clip and self._hover_part == 'fade_in'
+                fade_in_active = bool(self._drag_state) and self._drag_state.get('clip') is clip and self._drag_state.get('mode') == 'fade_in'
+                if fade_in_hovered or fade_in_active:
+                    glow_r_outer = r + 6
+                    glow_r_inner = r + 3
+                    self.create_oval(
+                        fade_in_x - glow_r_outer, handle_y - glow_r_outer, fade_in_x + glow_r_outer, handle_y + glow_r_outer,
+                        outline=Theme.WARNING, width=2
+                    )
+                    self.create_oval(
+                        fade_in_x - glow_r_inner, handle_y - glow_r_inner, fade_in_x + glow_r_inner, handle_y + glow_r_inner,
+                        outline=Theme.PLAYHEAD, width=2
+                    )
+                fade_in_fill = Theme.WARNING if fade_in_active else Theme.FG_HIGHLIGHT
+                self.create_oval(
+                    fade_in_x - r, handle_y - r, fade_in_x + r, handle_y + r,
+                    fill=fade_in_fill, outline=''
+                )
 
                 fade_out_x = end_x - int(fade_out * self.pixels_per_second)
                 fade_out_x = max(start_x, min(fade_out_x, end_x))
                 if fade_out > 0:
                     fade_px = max(1, end_x - fade_out_x)
-                    steps = max(4, min(32, fade_px // 8))
+                    # More steps for smoother anti-aliased curve
+                    steps = max(12, min(64, fade_px // 4))
                     curve = clip.get('fade_out_curve', 0.0)
                     points = []
                     for i in range(steps + 1):
                         p = i / steps
                         g = self._curve_gain(1.0 - p, curve)
-                        x = fade_out_x + int(p * fade_px)
-                        y_pt = int(line_bottom - g * line_height)
+                        x = fade_out_x + (p * fade_px)
+                        y_pt = line_bottom - g * line_height
                         points.extend([x, y_pt])
                     if len(points) >= 4:
-                        self.create_line(points, fill=Theme.PLAYHEAD, width=1, smooth=True)
+                        # Draw shadow for depth
+                        shadow_points = [p + 1 if i % 2 == 1 else p for i, p in enumerate(points)]
+                        self.create_line(shadow_points, fill='#000000', width=3, smooth=True, splinesteps=36)
+                        # Main curve with thicker stroke and high spline smoothness
+                        self.create_line(points, fill=Theme.PLAYHEAD, width=2, smooth=True, splinesteps=36)
 
                     if is_selected and fade_px >= (curve_r * 4):
                         mid_x = fade_out_x + (fade_px / 2)
                         mid_g = self._curve_gain(0.5, curve)
-                        mid_y = int(line_bottom - mid_g * line_height)
+                        mid_y = line_bottom - mid_g * line_height
+                        # Control point with outline for better visibility
+                        self.create_oval(mid_x - curve_r - 1, mid_y - curve_r - 1, mid_x + curve_r + 1, mid_y + curve_r + 1,
+                                         fill='#000000', outline='')
                         self.create_oval(mid_x - curve_r, mid_y - curve_r, mid_x + curve_r, mid_y + curve_r,
-                                         fill=Theme.PLAYHEAD, outline='')
-                self.create_oval(fade_out_x - r, handle_y - r, fade_out_x + r, handle_y + r,
-                                 fill=Theme.FG_HIGHLIGHT, outline='')
+                                         fill=Theme.PLAYHEAD, outline=Theme.FG_HIGHLIGHT, width=1)
+                fade_out_hovered = self._hover_clip is clip and self._hover_part == 'fade_out'
+                fade_out_active = bool(self._drag_state) and self._drag_state.get('clip') is clip and self._drag_state.get('mode') == 'fade_out'
+                if fade_out_hovered or fade_out_active:
+                    glow_r_outer = r + 6
+                    glow_r_inner = r + 3
+                    self.create_oval(
+                        fade_out_x - glow_r_outer, handle_y - glow_r_outer, fade_out_x + glow_r_outer, handle_y + glow_r_outer,
+                        outline=Theme.WARNING, width=2
+                    )
+                    self.create_oval(
+                        fade_out_x - glow_r_inner, handle_y - glow_r_inner, fade_out_x + glow_r_inner, handle_y + glow_r_inner,
+                        outline=Theme.PLAYHEAD, width=2
+                    )
+                fade_out_fill = Theme.WARNING if fade_out_active else Theme.FG_HIGHLIGHT
+                self.create_oval(
+                    fade_out_x - r, handle_y - r, fade_out_x + r, handle_y + r,
+                    fill=fade_out_fill, outline=''
+                )
 
         # Clip name (top left)
         clip_name = clip.get('name', 'Clip')
