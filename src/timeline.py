@@ -4,6 +4,7 @@ import tkinter as tk
 from typing import Optional, Callable, Dict, TYPE_CHECKING
 
 from .theme import Theme
+from .ui_components import draw_add_button
 
 if TYPE_CHECKING:
     from .audio_engine import AudioEngine
@@ -51,6 +52,7 @@ class TimelineCanvas(tk.Canvas):
 
         # Button hit areas (track_index -> (x1, y1, x2, y2))
         self._add_buttons = {}
+        self._hovered_add_button: Optional[int] = None
 
         # Clip thumbnails cache
         self._thumbnails = {}
@@ -105,6 +107,9 @@ class TimelineCanvas(tk.Canvas):
     def _on_leave(self, event):
         if self._drag_state:
             return
+        if self._hovered_add_button is not None:
+            self._hovered_add_button = None
+            self._draw()
         self._set_hover_target(None, None)
         self.config(cursor='')
 
@@ -391,9 +396,16 @@ class TimelineCanvas(tk.Canvas):
         # Add button hover
         for track_idx, (x1, y1, x2, y2) in self._add_buttons.items():
             if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                if self._hovered_add_button != track_idx:
+                    self._hovered_add_button = track_idx
+                    self._draw()
                 self._set_hover_target(None, None)
                 self.config(cursor='hand2')
                 return
+        
+        if self._hovered_add_button is not None:
+            self._hovered_add_button = None
+            self._draw()
 
         # Track M/S hover and track label drag hover
         track_idx = self._track_index_at_y(event.y)
@@ -921,12 +933,11 @@ class TimelineCanvas(tk.Canvas):
         self.create_rectangle(42, y + 50, 66, y + 70, fill=s_color, outline=Theme.BORDER)
         self.create_text(54, y + 60, text='S', fill=Theme.FG_HIGHLIGHT, font=('Segoe UI', 9, 'bold'))
 
-        # Add media button (+)
-        btn_x1, btn_y1 = 100, y + 50
-        btn_x2, btn_y2 = 140, y + 70
-        self.create_rectangle(btn_x1, btn_y1, btn_x2, btn_y2, fill=Theme.SUCCESS, outline=Theme.BORDER)
-        self.create_text((btn_x1 + btn_x2) // 2, (btn_y1 + btn_y2) // 2, text='+',
-                        fill=Theme.BG_MAIN, font=('Segoe UI', 14, 'bold'))
+        # Add media button (+) - professional rounded design
+        btn_x1, btn_y1 = 90, y + 50
+        btn_x2, btn_y2 = 140, y + 72
+        is_hovered = self._hovered_add_button == track_idx
+        draw_add_button(self, btn_x1, btn_y1, btn_x2, btn_y2, hovered=is_hovered)
         self._add_buttons[track_idx] = (btn_x1, btn_y1, btn_x2, btn_y2)
 
         # Track content area

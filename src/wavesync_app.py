@@ -15,7 +15,7 @@ from .media_info import MediaInfo
 from .video_extractor import VideoFrameExtractor
 from .video_preview import VideoPreviewStream
 from .theme import Theme
-from .ui_components import RoundedButton, IconButton
+from .ui_components import RoundedButton, IconButton, MediaButton
 
 
 class WaveSyncApp:
@@ -138,27 +138,21 @@ class WaveSyncApp:
         transport_frame = ttk.Frame(toolbar, style='Panel.TFrame')
         transport_frame.pack(side='left', padx=20, pady=10)
 
-        self.skip_back_btn = IconButton(transport_frame, text="⏮", command=self._on_skip_back, 
-                                      width=36, height=36, radius=8,
-                                      bg_color=Theme.BG_INPUT, hover_color=Theme.BG_HOVER)
-        self.skip_back_btn.pack(side='left', padx=4)
+        self.skip_back_btn = MediaButton(transport_frame, MediaButton.SKIP_BACK, 
+                                        command=self._on_skip_back, size=38, circular=False)
+        self.skip_back_btn.pack(side='left', padx=3)
 
-        self.play_btn = RoundedButton(transport_frame, text="▶", command=self._on_play_pause,
-                                    width=60, height=36, radius=18,
-                                    bg_color=Theme.SUCCESS, hover_color=Theme.SUCCESS_HOVER,
-                                    fg_color=Theme.BG_MAIN, font=Theme.FONT_LARGE_BOLD)
-        self.play_btn.pack(side='left', padx=10)
+        self.play_btn = MediaButton(transport_frame, MediaButton.PLAY, 
+                                   command=self._on_play_pause, size=42, circular=True)
+        self.play_btn.pack(side='left', padx=6)
 
-        self.stop_btn = RoundedButton(transport_frame, text="⏹", command=self._on_stop,
-                                    width=40, height=36, radius=8,
-                                    bg_color=Theme.ERROR, hover_color=Theme.ERROR_HOVER,
-                                    fg_color=Theme.BG_MAIN, font=Theme.FONT_LARGE)
-        self.stop_btn.pack(side='left', padx=4)
+        self.stop_btn = MediaButton(transport_frame, MediaButton.STOP, 
+                                   command=self._on_stop, size=42, circular=True)
+        self.stop_btn.pack(side='left', padx=6)
 
-        self.skip_fwd_btn = IconButton(transport_frame, text="⏭", command=self._on_skip_forward,
-                                     width=36, height=36, radius=8,
-                                     bg_color=Theme.BG_INPUT, hover_color=Theme.BG_HOVER)
-        self.skip_fwd_btn.pack(side='left', padx=4)
+        self.skip_fwd_btn = MediaButton(transport_frame, MediaButton.SKIP_FORWARD, 
+                                       command=self._on_skip_forward, size=38, circular=False)
+        self.skip_fwd_btn.pack(side='left', padx=3)
 
         # Time display
         self.time_label = tk.Label(toolbar, text="00:00:00 / 03:00:00",
@@ -471,8 +465,7 @@ class WaveSyncApp:
     def _play(self):
         """Start playback."""
         self.is_playing = True
-        self.play_btn.set_text("⏸")
-        self.play_btn.set_colors(bg_color=Theme.WARNING, hover_color=Theme.WARNING)
+        self.play_btn.set_icon(MediaButton.PAUSE)
         self.status_label.config(text="Playing...")
 
         # Store the play start position for the dashed marker
@@ -494,8 +487,7 @@ class WaveSyncApp:
         if not self.audio_engine.is_active():
             self.is_playing = False
             self.timeline.play_start_position = None
-            self.play_btn.set_text("▶")
-            self.play_btn.set_colors(bg_color=Theme.SUCCESS, hover_color=Theme.SUCCESS_HOVER)
+            self.play_btn.set_icon(MediaButton.PLAY)
             self.status_label.config(text="Audio output unavailable")
             return
 
@@ -517,8 +509,7 @@ class WaveSyncApp:
     def _pause(self):
         self.is_playing = False
         self.audio_engine.pause()
-        self.play_btn.set_text("▶")
-        self.play_btn.set_colors(bg_color=Theme.SUCCESS, hover_color=Theme.SUCCESS_HOVER)
+        self.play_btn.set_icon(MediaButton.PLAY)
         self.status_label.config(text="Paused")
         if self.playback_job:
             self.root.after_cancel(self.playback_job)
@@ -532,9 +523,8 @@ class WaveSyncApp:
 
     def _on_stop(self):
         self.is_playing = False
-        self.audio_engine.stop()  # Stops and resets position to 0
-        self.play_btn.set_text("▶")
-        self.play_btn.set_colors(bg_color=Theme.SUCCESS, hover_color=Theme.SUCCESS_HOVER)
+        self.audio_engine.stop()
+        self.play_btn.set_icon(MediaButton.PLAY)
         if self.playback_job:
             self.root.after_cancel(self.playback_job)
             self.playback_job = None

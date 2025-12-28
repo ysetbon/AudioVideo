@@ -26,6 +26,35 @@ class Theme:
     BORDER = '#3e3e42'       # Borders/Separators
     PLAYHEAD = '#d7ba7d'     # Yellow/Orange for playhead
     
+    # Professional Transport Button Colors
+    # Play button - vibrant green
+    PLAY_BG = '#2d8a4e'
+    PLAY_HOVER = '#3ba55d'
+    PLAY_ACTIVE = '#248a46'
+    PLAY_ICON = '#ffffff'
+    PLAY_GLOW = '#4cc76f'
+    
+    # Pause button - amber/orange
+    PAUSE_BG = '#d4a016'
+    PAUSE_HOVER = '#e6b422'
+    PAUSE_ACTIVE = '#c4940e'
+    PAUSE_ICON = '#1e1e1e'
+    PAUSE_GLOW = '#f0c432'
+    
+    # Stop button - subtle red
+    STOP_BG = '#c94a4a'
+    STOP_HOVER = '#dc5c5c'
+    STOP_ACTIVE = '#b83c3c'
+    STOP_ICON = '#ffffff'
+    STOP_GLOW = '#e87070'
+    
+    # Generic transport buttons (skip, etc)
+    TRANSPORT_BG = '#404040'
+    TRANSPORT_HOVER = '#525252'
+    TRANSPORT_ACTIVE = '#363636'
+    TRANSPORT_ICON = '#e0e0e0'
+    TRANSPORT_GLOW = '#666666'
+    
     # Track Colors (Pastels for visibility)
     TRACK_VIDEO = '#c586c0'  # Purple
     TRACK_AUDIO_1 = '#4ec9b0' # Teal
