@@ -1,5 +1,6 @@
 """Main WaveSync application window."""
 import os
+import json
 import math
 import wave
 import threading
@@ -35,6 +36,7 @@ class WaveSyncApp:
         self.selected_clip = None
         self.selected_track_idx = None
         self.clipboard_clip = None  # For copy/paste
+        self.project_filepath = None  # Current project file path
 
         # Audio engine (loads audio into memory like Audacity)
         self.audio_engine = AudioEngine()
@@ -95,6 +97,7 @@ class WaveSyncApp:
         file_menu.add_command(label="New Project", accelerator="Ctrl+N", command=self._on_new)
         file_menu.add_command(label="Open Project...", accelerator="Ctrl+O", command=self._on_open)
         file_menu.add_command(label="Save Project", accelerator="Ctrl+S", command=self._on_save)
+        file_menu.add_command(label="Save Project As...", accelerator="Ctrl+Shift+S", command=self._on_save_as)
         file_menu.add_separator()
         file_menu.add_command(label="Import Media...", accelerator="Ctrl+I", command=self._on_import)
         file_menu.add_command(label="Export...", accelerator="Ctrl+E", command=self._on_export)
@@ -103,8 +106,8 @@ class WaveSyncApp:
         file_menu.add_command(label="Exit", accelerator="Alt+F4", command=self._on_close)
 
         edit_menu = create_menu(menubar, "Edit")
-        edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", state='disabled')
-        edit_menu.add_command(label="Redo", accelerator="Ctrl+Y", state='disabled')
+        edit_menu.add_command(label="Undo", accelerator="Ctrl+Z", command=self._on_undo)
+        edit_menu.add_command(label="Redo", accelerator="Ctrl+Y", command=self._on_redo)
         edit_menu.add_separator()
         edit_menu.add_command(label="Copy", accelerator="Ctrl+C", command=self._on_copy)
         edit_menu.add_command(label="Paste", accelerator="Ctrl+V", command=self._on_paste)
@@ -150,9 +153,22 @@ class WaveSyncApp:
                                    command=self._on_stop, size=42, circular=True)
         self.stop_btn.pack(side='left', padx=6)
 
-        self.skip_fwd_btn = MediaButton(transport_frame, MediaButton.SKIP_FORWARD, 
+        self.skip_fwd_btn = MediaButton(transport_frame, MediaButton.SKIP_FORWARD,
                                        command=self._on_skip_forward, size=38, circular=False)
         self.skip_fwd_btn.pack(side='left', padx=3)
+
+        # Separator
+        separator = ttk.Frame(transport_frame, width=2, style='Panel.TFrame')
+        separator.pack(side='left', padx=10, fill='y', pady=8)
+
+        # Undo/Redo buttons
+        self.undo_btn = MediaButton(transport_frame, MediaButton.UNDO,
+                                   command=self._on_undo, size=40, circular=False)
+        self.undo_btn.pack(side='left', padx=4)
+
+        self.redo_btn = MediaButton(transport_frame, MediaButton.REDO,
+                                   command=self._on_redo, size=40, circular=False)
+        self.redo_btn.pack(side='left', padx=4)
 
         # Time display
         self.time_label = tk.Label(toolbar, text="00:00:00 / 03:00:00",
@@ -259,7 +275,8 @@ class WaveSyncApp:
         self.root.bind('<Control-i>', lambda e: self._on_import())
         self.root.bind('<Control-I>', lambda e: self._on_import())
         self.root.bind('<Control-s>', lambda e: self._on_save())
-        self.root.bind('<Control-S>', lambda e: self._on_save())
+        self.root.bind('<Control-Shift-s>', lambda e: self._on_save_as())
+        self.root.bind('<Control-Shift-S>', lambda e: self._on_save_as())
         self.root.bind('<Control-o>', lambda e: self._on_open())
         self.root.bind('<Control-O>', lambda e: self._on_open())
         self.root.bind('<Control-n>', lambda e: self._on_new())
@@ -270,6 +287,10 @@ class WaveSyncApp:
         self.root.bind('<Control-V>', lambda e: self._on_paste())
         self.root.bind('<s>', lambda e: self._on_split())
         self.root.bind('<F1>', lambda e: self._on_shortcuts())
+        self.root.bind('<Control-z>', lambda e: self._on_undo())
+        self.root.bind('<Control-Z>', lambda e: self._on_undo())
+        self.root.bind('<Control-y>', lambda e: self._on_redo())
+        self.root.bind('<Control-Y>', lambda e: self._on_redo())
 
     def _update_time_display(self):
         current = self._format_time(self.playhead_position)
@@ -611,9 +632,12 @@ class WaveSyncApp:
         self.timeline._waveform_cache.clear()
         for track in self.timeline.tracks:
             track['clips'] = []
+        self.timeline.selected_clip = None
         self.timeline._draw()
         self.preview_label.config(image='', text="Video Preview\n\nLoad a video to see preview")
         self.preview_image = None
+        self.project_filepath = None
+        self.root.title("WaveSync - Audio/Video Editor")
         self.status_label.config(text="New project created")
 
     def _on_open(self):
@@ -621,11 +645,106 @@ class WaveSyncApp:
             title="Open Project",
             filetypes=[("WaveSync Projects", "*.wavesync"), ("All Files", "*.*")]
         )
-        if filepath:
-            self.status_label.config(text=f"Opened: {os.path.basename(filepath)}")
+        if not filepath:
+            return
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # Stop playback
+            self._on_stop()
+
+            # Clear current audio from memory
+            self.audio_engine.loaded_audio.clear()
+            self.timeline._waveform_cache.clear()
+
+            # Get project directory for resolving relative paths
+            project_dir = os.path.dirname(os.path.abspath(filepath))
+
+            # Load timeline data
+            self.timeline.load_project_data(data, project_dir)
+
+            # Reload audio files for all clips
+            missing_files = []
+            for track in self.timeline.tracks:
+                for clip in track.get('clips', []):
+                    audio_path = clip.get('path', '')
+                    if audio_path and os.path.exists(audio_path):
+                        if audio_path not in self.audio_engine.loaded_audio:
+                            try:
+                                self.audio_engine.load_audio(audio_path)
+                            except Exception as e:
+                                missing_files.append(audio_path)
+                    elif audio_path:
+                        missing_files.append(audio_path)
+
+            # Update project state
+            self.project_filepath = filepath
+            self.root.title(f"WaveSync - {os.path.basename(filepath)}")
+
+            # Redraw timeline
+            self.timeline._draw()
+
+            if missing_files:
+                self.status_label.config(text=f"Opened: {os.path.basename(filepath)} ({len(missing_files)} missing files)")
+                messagebox.showwarning(
+                    "Missing Files",
+                    f"The following media files could not be found:\n\n" +
+                    "\n".join(missing_files[:5]) +
+                    ("\n..." if len(missing_files) > 5 else "")
+                )
+            else:
+                self.status_label.config(text=f"Opened: {os.path.basename(filepath)}")
+
+        except json.JSONDecodeError as e:
+            messagebox.showerror("Error", f"Invalid project file format:\n{e}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open project:\n{e}")
 
     def _on_save(self):
-        self.status_label.config(text="Project saved")
+        if self.project_filepath:
+            self._save_project(self.project_filepath)
+        else:
+            self._on_save_as()
+
+    def _on_save_as(self):
+        filepath = filedialog.asksaveasfilename(
+            title="Save Project As",
+            defaultextension=".wavesync",
+            filetypes=[("WaveSync Projects", "*.wavesync"), ("All Files", "*.*")]
+        )
+        if filepath:
+            self._save_project(filepath)
+
+    def _save_project(self, filepath: str):
+        try:
+            # Get project data from timeline
+            data = self.timeline.get_project_data()
+
+            # Add relative paths for portability
+            project_dir = os.path.dirname(os.path.abspath(filepath))
+            for track in data.get('tracks', []):
+                for clip in track.get('clips', []):
+                    abs_path = clip.get('path', '')
+                    if abs_path:
+                        try:
+                            rel_path = os.path.relpath(abs_path, project_dir)
+                            clip['relative_path'] = rel_path
+                        except ValueError:
+                            # Can happen on Windows with different drives
+                            clip['relative_path'] = ''
+
+            # Save to file
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+
+            self.project_filepath = filepath
+            self.root.title(f"WaveSync - {os.path.basename(filepath)}")
+            self.status_label.config(text=f"Saved: {os.path.basename(filepath)}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save project:\n{e}")
 
     def _on_import(self):
         filepath = filedialog.askopenfilename(
@@ -913,6 +1032,20 @@ class WaveSyncApp:
     def _on_split(self):
         self.status_label.config(text=f"Split at {self.playhead_position:.2f}s")
 
+    def _on_undo(self):
+        """Undo last action."""
+        if self.timeline.undo():
+            self.status_label.config(text="Undo")
+        else:
+            self.status_label.config(text="Nothing to undo")
+
+    def _on_redo(self):
+        """Redo last undone action."""
+        if self.timeline.redo():
+            self.status_label.config(text="Redo")
+        else:
+            self.status_label.config(text="Nothing to redo")
+
     def _on_copy(self):
         """Copy the selected clip to clipboard."""
         if not self.selected_clip:
@@ -998,8 +1131,11 @@ PLAYBACK:
   Home / End - Go to start/end
 
 EDITING:
+  Ctrl+Z - Undo
+  Ctrl+Y - Redo
   Ctrl+C - Copy selected clip
   Ctrl+V - Paste at playhead
+  Delete - Delete selected clip
   S - Split at playhead
   Ctrl+I - Import media
   Ctrl+S - Save project

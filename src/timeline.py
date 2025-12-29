@@ -1,5 +1,7 @@
 """Timeline canvas widget for displaying tracks and clips."""
+import copy
 import math
+import os
 import tkinter as tk
 from typing import Optional, Callable, Dict, TYPE_CHECKING
 
@@ -82,6 +84,12 @@ class TimelineCanvas(tk.Canvas):
         # Slice tool state
         self._slice_hover_info: Optional[dict] = None  # {'track_idx': int, 'clip': dict, 'time': float, 'x': int}
 
+        # Undo/Redo stacks
+        self._undo_stack: list = []
+        self._redo_stack: list = []
+        self._max_undo_levels = 50
+        self._pending_undo_state: Optional[dict] = None  # State saved before operation starts
+
         self._clip_edge_px = 8
         self._min_clip_duration = 0.05  # seconds
         self._fade_handle_radius = 5
@@ -133,6 +141,9 @@ class TimelineCanvas(tk.Canvas):
         """Delete the currently selected clip."""
         if self.selected_clip is None:
             return
+
+        # Save state for undo before deleting
+        self.save_undo_state()
 
         # Find and remove the clip from its track
         for track_idx, track in enumerate(self.tracks):
@@ -244,12 +255,14 @@ class TimelineCanvas(tk.Canvas):
             track_y1, _track_y2 = bounds
             ms_x = self.tool_panel_width + 8
             if ms_x <= event.x <= (ms_x + 24) and (track_y1 + 50) <= event.y <= (track_y1 + 70):
+                self.save_undo_state()
                 self.tracks[track_idx]['muted'] = not self.tracks[track_idx].get('muted', False)
                 self._draw()
                 if self.on_timeline_edited:
                     self.on_timeline_edited()
                 return
             if (ms_x + 30) <= event.x <= (ms_x + 54) and (track_y1 + 50) <= event.y <= (track_y1 + 70):
+                self.save_undo_state()
                 self.tracks[track_idx]['solo'] = not self.tracks[track_idx].get('solo', False)
                 self._draw()
                 if self.on_timeline_edited:
@@ -258,6 +271,7 @@ class TimelineCanvas(tk.Canvas):
 
             # Click on track label area (upper part, above buttons) - start track reorder drag
             if event.y < (track_y1 + 45):
+                self.save_undo_state()
                 self._drag_state = {
                     'mode': 'reorder_track',
                     'track_idx': track_idx,
@@ -278,6 +292,9 @@ class TimelineCanvas(tk.Canvas):
             self.selected_clip = hit_clip
             if self.on_clip_select:
                 self.on_clip_select(hit_clip, hit_track_idx)
+
+            # Save state for undo before potential drag operation
+            self.save_undo_state()
 
             start_time = float(hit_clip.get('start', 0.0))
             duration = float(hit_clip.get('duration', 0.0))
@@ -422,6 +439,9 @@ class TimelineCanvas(tk.Canvas):
                 min_slice_dist = self._min_clip_duration
                 slice_time = max(clip_start + min_slice_dist,
                                min(slice_time, clip_start + clip_duration - min_slice_dist))
+
+                # Save state for undo before slicing
+                self.save_undo_state()
 
                 # Perform the slice
                 if self._slice_clip(track_idx, clip, slice_time):
@@ -1648,3 +1668,202 @@ class TimelineCanvas(tk.Canvas):
                 self._playhead_handle_id = None
 
         self.tag_raise('playhead')
+
+    # ============== Undo/Redo ==============
+
+    def _get_tracks_snapshot(self) -> list:
+        """Create a deep copy of all tracks and clips for undo/redo."""
+        return copy.deepcopy(self.tracks)
+
+    def _restore_tracks_snapshot(self, snapshot: list):
+        """Restore tracks from a snapshot."""
+        self.tracks = copy.deepcopy(snapshot)
+        self.selected_clip = None
+        self._hover_clip = None
+        self._slice_hover_info = None
+        self._recompute_track_layout()
+        self._draw()
+
+    def save_undo_state(self):
+        """Save current state to undo stack. Call this BEFORE making changes."""
+        # Save current state
+        state = self._get_tracks_snapshot()
+        self._undo_stack.append(state)
+
+        # Limit stack size
+        if len(self._undo_stack) > self._max_undo_levels:
+            self._undo_stack.pop(0)
+
+        # Clear redo stack when new action is performed
+        self._redo_stack.clear()
+
+    def undo(self) -> bool:
+        """Undo the last action. Returns True if undo was performed."""
+        if not self._undo_stack:
+            return False
+
+        # Save current state to redo stack
+        current_state = self._get_tracks_snapshot()
+        self._redo_stack.append(current_state)
+
+        # Restore previous state
+        previous_state = self._undo_stack.pop()
+        self._restore_tracks_snapshot(previous_state)
+
+        if self.on_timeline_edited:
+            self.on_timeline_edited()
+
+        return True
+
+    def redo(self) -> bool:
+        """Redo the last undone action. Returns True if redo was performed."""
+        if not self._redo_stack:
+            return False
+
+        # Save current state to undo stack
+        current_state = self._get_tracks_snapshot()
+        self._undo_stack.append(current_state)
+
+        # Restore next state
+        next_state = self._redo_stack.pop()
+        self._restore_tracks_snapshot(next_state)
+
+        if self.on_timeline_edited:
+            self.on_timeline_edited()
+
+        return True
+
+    def clear_undo_history(self):
+        """Clear all undo/redo history."""
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+
+    # ============== Project Data ==============
+
+    def get_project_data(self) -> dict:
+        """Export all timeline data for saving to a project file."""
+        tracks_data = []
+        for track in self.tracks:
+            track_data = {
+                'name': track.get('name', ''),
+                'type': track.get('type', 'audio'),
+                'color': track.get('color', ''),
+                'muted': track.get('muted', False),
+                'solo': track.get('solo', False),
+                'height': track.get('height', self.track_height),
+                'clips': []
+            }
+
+            for clip in track.get('clips', []):
+                clip_data = {
+                    'name': clip.get('name', ''),
+                    'path': clip.get('path', ''),
+                    'start': clip.get('start', 0.0),
+                    'duration': clip.get('duration', 0.0),
+                    'source_start': clip.get('source_start', 0.0),
+                    'media_duration': clip.get('media_duration'),
+                    'fade_in': clip.get('fade_in', 0.0),
+                    'fade_out': clip.get('fade_out', 0.0),
+                    'fade_in_curve': clip.get('fade_in_curve', 0.0),
+                    'fade_out_curve': clip.get('fade_out_curve', 0.0),
+                }
+                # Include frame_rate if present
+                if 'frame_rate' in clip:
+                    clip_data['frame_rate'] = clip['frame_rate']
+                track_data['clips'].append(clip_data)
+
+            tracks_data.append(track_data)
+
+        return {
+            'version': 1,
+            'timeline': {
+                'duration': self.duration,
+                'pixels_per_second': self.pixels_per_second,
+                'playhead_position': self.playhead_position,
+                'scroll_offset': self.scroll_offset,
+            },
+            'tracks': tracks_data,
+            'current_tool': self._current_tool,
+        }
+
+    def load_project_data(self, data: dict, project_dir: str = None):
+        """Load timeline data from a project file.
+
+        Args:
+            data: Project data dictionary
+            project_dir: Directory of the project file (for resolving relative paths)
+        """
+        # Clear current state
+        self.selected_clip = None
+        self._hover_clip = None
+        self._slice_hover_info = None
+
+        # Load timeline settings
+        timeline_data = data.get('timeline', {})
+        self.duration = timeline_data.get('duration', 180)
+        self.pixels_per_second = timeline_data.get('pixels_per_second', 100)
+        self.playhead_position = timeline_data.get('playhead_position', 0.0)
+        self.scroll_offset = timeline_data.get('scroll_offset', 0)
+
+        # Load tool selection
+        self._current_tool = data.get('current_tool', 'select')
+
+        # Load tracks
+        tracks_data = data.get('tracks', [])
+        self.tracks = []
+
+        for track_data in tracks_data:
+            track = {
+                'name': track_data.get('name', ''),
+                'type': track_data.get('type', 'audio'),
+                'color': track_data.get('color', Theme.TRACK_AUDIO_1),
+                'muted': track_data.get('muted', False),
+                'solo': track_data.get('solo', False),
+                'height': track_data.get('height', self.track_height),
+                'clips': []
+            }
+
+            for clip_data in track_data.get('clips', []):
+                # Resolve file path
+                file_path = clip_data.get('path', '')
+
+                # Try relative path first if project_dir is provided
+                if project_dir and file_path:
+                    # Check if it's a relative path stored in the project
+                    relative_path = clip_data.get('relative_path', '')
+                    if relative_path:
+                        resolved_path = os.path.join(project_dir, relative_path)
+                        if os.path.exists(resolved_path):
+                            file_path = resolved_path
+                    # Fall back to absolute path
+                    if not os.path.exists(file_path):
+                        # Path doesn't exist, keep it anyway (user might fix it)
+                        pass
+
+                clip = {
+                    'name': clip_data.get('name', ''),
+                    'path': file_path,
+                    'start': float(clip_data.get('start', 0.0)),
+                    'duration': float(clip_data.get('duration', 0.0)),
+                    'source_start': float(clip_data.get('source_start', 0.0)),
+                    'media_duration': clip_data.get('media_duration'),
+                    'fade_in': float(clip_data.get('fade_in', 0.0)),
+                    'fade_out': float(clip_data.get('fade_out', 0.0)),
+                    'fade_in_curve': float(clip_data.get('fade_in_curve', 0.0)),
+                    'fade_out_curve': float(clip_data.get('fade_out_curve', 0.0)),
+                }
+                if 'frame_rate' in clip_data:
+                    clip['frame_rate'] = clip_data['frame_rate']
+
+                track['clips'].append(clip)
+
+            self.tracks.append(track)
+
+        # If no tracks loaded, create defaults
+        if not self.tracks:
+            self._create_default_tracks()
+
+        self._recompute_track_layout()
+        self._waveform_cache.clear()
+        self._clamp_scroll_offset()
+        self._draw()
