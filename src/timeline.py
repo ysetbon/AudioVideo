@@ -56,6 +56,10 @@ class TimelineCanvas(tk.Canvas):
         self._current_tool = 'select'
         self._hovered_tool: Optional[str] = None
         self._tool_buttons: Dict[str, tuple] = {}  # tool_name -> (x1, y1, x2, y2)
+
+        # Magnet/snap toggle (independent of tool selection)
+        self._magnet_enabled = False
+        self._snap_threshold_px = 10  # Snap when within 10 pixels of edge
         self._track_resize_grab_px = 5
         self._track_layout: list[tuple[int, int]] = []  # (y1, y2) per track
 
@@ -220,7 +224,11 @@ class TimelineCanvas(tk.Canvas):
         # Check if click is on a tool button
         for tool_name, (x1, y1, x2, y2) in self._tool_buttons.items():
             if x1 <= event.x <= x2 and y1 <= event.y <= y2:
-                self._current_tool = tool_name
+                if tool_name == 'magnet':
+                    # Magnet is a toggle, not a tool selection
+                    self._magnet_enabled = not self._magnet_enabled
+                else:
+                    self._current_tool = tool_name
                 self._draw()
                 return
 
@@ -303,7 +311,7 @@ class TimelineCanvas(tk.Canvas):
             if media_duration is None and self.audio_engine and hit_clip.get('path') in self.audio_engine.loaded_audio:
                 media_duration = self.audio_engine.loaded_audio[hit_clip.get('path')].duration
 
-            clip_start_x = self._content_start_x + (start_time * self.pixels_per_second)
+            clip_start_x = self._content_start_x + (start_time * self.pixels_per_second) - self.scroll_offset
             curve_target = None
             curve_start = None
             if hit_part in ('fade_in', 'fade_in_curve'):
@@ -753,7 +761,10 @@ class TimelineCanvas(tk.Canvas):
                 if not rect:
                     continue
                 x1, y1, x2, y2 = rect
-                if x1 <= x <= x2 and y1 <= y <= y2:
+                if y1 <= y <= y2 and x >= self._content_start_x:
+                    visible_x1 = max(float(x1), float(self._content_start_x))
+                    if not (visible_x1 <= float(x) <= float(x2)):
+                        continue
                     if not clip.get('loading'):
                         is_selected = clip is self.selected_clip
                         handle_y = y1 + self._fade_handle_y_offset
@@ -828,7 +839,71 @@ class TimelineCanvas(tk.Canvas):
 
         if mode == 'move':
             new_start = (float(x) - self._content_start_x + self.scroll_offset - float(state['grab_offset_x'])) / self.pixels_per_second
-            clip['start'] = max(0.0, new_start)
+            new_start = max(0.0, new_start)
+
+            # Apply magnet/snap if enabled
+            if self._magnet_enabled and self._current_tool == 'select':
+                clip_duration = float(clip.get('duration', 0.0))
+                new_end = new_start + clip_duration
+                snap_threshold = self._snap_threshold_px / self.pixels_per_second
+
+                # Get all other clips in the same track
+                track = self.tracks[track_idx]
+                other_clips = [c for c in track.get('clips', []) if c is not clip]
+
+                best_snap = None
+                best_snap_dist = snap_threshold
+
+                for other in other_clips:
+                    other_start = float(other.get('start', 0.0))
+                    other_end = other_start + float(other.get('duration', 0.0))
+
+                    # Check if moving clip's start snaps to other clip's end
+                    dist = abs(new_start - other_end)
+                    if dist < best_snap_dist:
+                        best_snap = ('start_to_end', other_end)
+                        best_snap_dist = dist
+
+                    # Check if moving clip's end snaps to other clip's start
+                    dist = abs(new_end - other_start)
+                    if dist < best_snap_dist:
+                        best_snap = ('end_to_start', other_start - clip_duration)
+                        best_snap_dist = dist
+
+                    # Also snap to other clip's start (align starts)
+                    dist = abs(new_start - other_start)
+                    if dist < best_snap_dist:
+                        best_snap = ('start_to_start', other_start)
+                        best_snap_dist = dist
+
+                    # Also snap to other clip's end (align ends)
+                    dist = abs(new_end - other_end)
+                    if dist < best_snap_dist:
+                        best_snap = ('end_to_end', other_end - clip_duration)
+                        best_snap_dist = dist
+
+                # Also snap to timeline start (time 0)
+                dist = abs(new_start)
+                if dist < best_snap_dist:
+                    best_snap = ('start_to_zero', 0.0)
+                    best_snap_dist = dist
+
+                # Also snap to playhead position
+                dist = abs(new_start - self.playhead_position)
+                if dist < best_snap_dist:
+                    best_snap = ('start_to_playhead', self.playhead_position)
+                    best_snap_dist = dist
+
+                dist = abs(new_end - self.playhead_position)
+                if dist < best_snap_dist:
+                    best_snap = ('end_to_playhead', self.playhead_position - clip_duration)
+                    best_snap_dist = dist
+
+                # Apply the best snap if found
+                if best_snap:
+                    new_start = max(0.0, best_snap[1])
+
+            clip['start'] = new_start
 
         elif mode == 'trim_start':
             original_start = float(state['start_time'])
@@ -1218,6 +1293,35 @@ class TimelineCanvas(tk.Canvas):
         )
         self._tool_buttons['slice'] = (btn_x, btn_y, btn_x + btn_size, btn_y + btn_size)
 
+        # Magnet toggle button (horseshoe magnet icon)
+        btn_y += btn_size + btn_margin
+        magnet_active = self._magnet_enabled
+        magnet_hovered = self._hovered_tool == 'magnet'
+        magnet_bg = Theme.ACCENT if magnet_active else (Theme.BG_HOVER if magnet_hovered else Theme.BG_INPUT)
+        magnet_fg = Theme.FG_HIGHLIGHT if magnet_active else Theme.FG_SECONDARY
+
+        self.create_rectangle(btn_x, btn_y, btn_x + btn_size, btn_y + btn_size,
+                            fill=magnet_bg, outline=Theme.BORDER)
+        # Draw horseshoe magnet icon
+        magnet_cx = btn_x + btn_size // 2
+        magnet_cy = btn_y + btn_size // 2
+        # Draw U-shape for magnet
+        # Left arm
+        self.create_rectangle(magnet_cx - 8, magnet_cy - 6, magnet_cx - 4, magnet_cy + 6,
+                            fill=magnet_fg, outline='')
+        # Right arm
+        self.create_rectangle(magnet_cx + 4, magnet_cy - 6, magnet_cx + 8, magnet_cy + 6,
+                            fill=magnet_fg, outline='')
+        # Bottom connector (arc approximation with rectangle)
+        self.create_rectangle(magnet_cx - 8, magnet_cy + 2, magnet_cx + 8, magnet_cy + 6,
+                            fill=magnet_fg, outline='')
+        # Red and blue tips (classic magnet look)
+        self.create_rectangle(magnet_cx - 8, magnet_cy - 6, magnet_cx - 4, magnet_cy - 2,
+                            fill='#ff4444' if magnet_active else '#aa6666', outline='')
+        self.create_rectangle(magnet_cx + 4, magnet_cy - 6, magnet_cx + 8, magnet_cy - 2,
+                            fill='#4444ff' if magnet_active else '#6666aa', outline='')
+        self._tool_buttons['magnet'] = (btn_x, btn_y, btn_x + btn_size, btn_y + btn_size)
+
     def _draw_ruler(self, width):
         # Determine tick interval
         if self.pixels_per_second >= 100:
@@ -1330,12 +1434,19 @@ class TimelineCanvas(tk.Canvas):
         start_x = self._content_start_x + int(clip['start'] * self.pixels_per_second) - self.scroll_offset
         end_x = self._content_start_x + int((clip['start'] + clip['duration']) * self.pixels_per_second) - self.scroll_offset
 
-        # Skip drawing if clip is completely outside visible area
-        if end_x < self._content_start_x or start_x > width:
+        # Skip drawing if clip is completely outside visible area (content area only)
+        if end_x <= self._content_start_x or start_x >= width:
             return
         if end_x <= start_x + 2:
             end_x = start_x + 2
         clip_width = end_x - start_x
+
+        # Visible portion (avoid drawing into track header panel)
+        draw_left = max(start_x, self._content_start_x)
+        draw_right = min(end_x, width)
+        visible_width = int(draw_right - draw_left)
+        if visible_width <= 1:
+            return
 
         # Clip rectangle (darker background for waveform contrast)
         padding = 4
@@ -1356,15 +1467,19 @@ class TimelineCanvas(tk.Canvas):
             outline_color = Theme.FG_HIGHLIGHT if is_selected else track['color']
             outline_width = 2 if is_selected else 1
 
-        self.create_rectangle(start_x + 1, clip_y1, end_x - 1, clip_y2,
+        inset = 1 if visible_width >= 4 else 0
+        self.create_rectangle(draw_left + inset, clip_y1, draw_right - inset, clip_y2,
                             fill=bg_color, outline=outline_color, width=outline_width)
 
-        if is_selected and not is_loading and clip_width >= 12:
-            self.create_line(start_x + 2, clip_y1, start_x + 2, clip_y2, fill=Theme.FG_HIGHLIGHT)
-            self.create_line(end_x - 2, clip_y1, end_x - 2, clip_y2, fill=Theme.FG_HIGHLIGHT)
+        if is_selected and not is_loading and visible_width >= 12:
+            left_handle_x = max(start_x + 2, self._content_start_x + 2)
+            right_handle_x = min(end_x - 2, width - 2)
+            if right_handle_x > left_handle_x:
+                self.create_line(left_handle_x, clip_y1, left_handle_x, clip_y2, fill=Theme.FG_HIGHLIGHT)
+                self.create_line(right_handle_x, clip_y1, right_handle_x, clip_y2, fill=Theme.FG_HIGHLIGHT)
 
         # Draw waveform if audio engine available and clip has audio (not loading)
-        if not is_loading and self.audio_engine and clip.get('path') and clip_width > 10:
+        if not is_loading and self.audio_engine and clip.get('path') and visible_width > 10:
             self._draw_waveform(clip, track, start_x, clip_y1, clip_width, clip_height)
 
         # Fade handles / lines
@@ -1391,122 +1506,132 @@ class TimelineCanvas(tk.Canvas):
                 fade_in_x = max(start_x, min(fade_in_x, end_x))
                 if fade_in > 0:
                     fade_px = max(1, fade_in_x - start_x)
-                    # More steps for smoother anti-aliased curve
-                    steps = max(12, min(64, fade_px // 4))
                     curve = clip.get('fade_in_curve', 0.0)
-                    points = []
-                    for i in range(steps + 1):
-                        p = i / steps
-                        g = self._curve_gain(p, curve)
-                        x = start_x + (p * fade_px)
-                        y_pt = line_bottom - g * line_height
-                        points.extend([x, y_pt])
-                    if len(points) >= 4:
-                        # Draw shadow for depth
-                        shadow_points = [p + 1 if i % 2 == 1 else p for i, p in enumerate(points)]
-                        self.create_line(shadow_points, fill='#000000', width=3, smooth=True, splinesteps=36)
-                        # Main curve with thicker stroke and high spline smoothness
-                        self.create_line(points, fill=Theme.PLAYHEAD, width=2, smooth=True, splinesteps=36)
+                    p0 = max(0.0, (float(draw_left) - float(start_x)) / float(fade_px))
+                    p1 = min(1.0, (float(draw_right) - float(start_x)) / float(fade_px))
+                    if p1 > p0:
+                        visible_fade_px = max(1.0, (p1 - p0) * float(fade_px))
+                        steps = max(12, min(64, int(visible_fade_px) // 4))
+                        points = []
+                        for i in range(steps + 1):
+                            p = p0 + ((i / steps) * (p1 - p0))
+                            g = self._curve_gain(p, curve)
+                            x = start_x + (p * fade_px)
+                            y_pt = line_bottom - g * line_height
+                            points.extend([x, y_pt])
+                        if len(points) >= 4:
+                            # Draw shadow for depth
+                            shadow_points = [p + 1 if i % 2 == 1 else p for i, p in enumerate(points)]
+                            self.create_line(shadow_points, fill='#000000', width=3, smooth=True, splinesteps=36)
+                            # Main curve with thicker stroke and high spline smoothness
+                            self.create_line(points, fill=Theme.PLAYHEAD, width=2, smooth=True, splinesteps=36)
 
                     if is_selected and fade_px >= (curve_r * 4):
                         mid_x = start_x + (fade_px / 2)
-                        mid_g = self._curve_gain(0.5, curve)
-                        mid_y = line_bottom - mid_g * line_height
-                        # Control point with outline for better visibility
-                        self.create_oval(mid_x - curve_r - 1, mid_y - curve_r - 1, mid_x + curve_r + 1, mid_y + curve_r + 1,
-                                         fill='#000000', outline='')
-                        self.create_oval(mid_x - curve_r, mid_y - curve_r, mid_x + curve_r, mid_y + curve_r,
-                                         fill=Theme.PLAYHEAD, outline=Theme.FG_HIGHLIGHT, width=1)
+                        if float(draw_left) <= float(mid_x) <= float(draw_right):
+                            mid_g = self._curve_gain(0.5, curve)
+                            mid_y = line_bottom - mid_g * line_height
+                            # Control point with outline for better visibility
+                            self.create_oval(mid_x - curve_r - 1, mid_y - curve_r - 1, mid_x + curve_r + 1, mid_y + curve_r + 1,
+                                             fill='#000000', outline='')
+                            self.create_oval(mid_x - curve_r, mid_y - curve_r, mid_x + curve_r, mid_y + curve_r,
+                                             fill=Theme.PLAYHEAD, outline=Theme.FG_HIGHLIGHT, width=1)
                 fade_in_hovered = self._hover_clip is clip and self._hover_part == 'fade_in'
                 fade_in_active = bool(self._drag_state) and self._drag_state.get('clip') is clip and self._drag_state.get('mode') == 'fade_in'
-                if fade_in_hovered or fade_in_active:
-                    glow_r_outer = r + 6
-                    glow_r_inner = r + 3
+                if float(draw_left) <= float(fade_in_x) <= float(draw_right):
+                    if fade_in_hovered or fade_in_active:
+                        glow_r_outer = r + 6
+                        glow_r_inner = r + 3
+                        self.create_oval(
+                            fade_in_x - glow_r_outer, handle_y - glow_r_outer, fade_in_x + glow_r_outer, handle_y + glow_r_outer,
+                            outline=Theme.WARNING, width=2
+                        )
+                        self.create_oval(
+                            fade_in_x - glow_r_inner, handle_y - glow_r_inner, fade_in_x + glow_r_inner, handle_y + glow_r_inner,
+                            outline=Theme.PLAYHEAD, width=2
+                        )
+                    fade_in_fill = Theme.WARNING if fade_in_active else Theme.FG_HIGHLIGHT
                     self.create_oval(
-                        fade_in_x - glow_r_outer, handle_y - glow_r_outer, fade_in_x + glow_r_outer, handle_y + glow_r_outer,
-                        outline=Theme.WARNING, width=2
+                        fade_in_x - r, handle_y - r, fade_in_x + r, handle_y + r,
+                        fill=fade_in_fill, outline=''
                     )
-                    self.create_oval(
-                        fade_in_x - glow_r_inner, handle_y - glow_r_inner, fade_in_x + glow_r_inner, handle_y + glow_r_inner,
-                        outline=Theme.PLAYHEAD, width=2
-                    )
-                fade_in_fill = Theme.WARNING if fade_in_active else Theme.FG_HIGHLIGHT
-                self.create_oval(
-                    fade_in_x - r, handle_y - r, fade_in_x + r, handle_y + r,
-                    fill=fade_in_fill, outline=''
-                )
 
                 fade_out_x = end_x - int(fade_out * self.pixels_per_second)
                 fade_out_x = max(start_x, min(fade_out_x, end_x))
                 if fade_out > 0:
                     fade_px = max(1, end_x - fade_out_x)
-                    # More steps for smoother anti-aliased curve
-                    steps = max(12, min(64, fade_px // 4))
                     curve = clip.get('fade_out_curve', 0.0)
-                    points = []
-                    for i in range(steps + 1):
-                        p = i / steps
-                        g = self._curve_gain(1.0 - p, curve)
-                        x = fade_out_x + (p * fade_px)
-                        y_pt = line_bottom - g * line_height
-                        points.extend([x, y_pt])
-                    if len(points) >= 4:
-                        # Draw shadow for depth
-                        shadow_points = [p + 1 if i % 2 == 1 else p for i, p in enumerate(points)]
-                        self.create_line(shadow_points, fill='#000000', width=3, smooth=True, splinesteps=36)
-                        # Main curve with thicker stroke and high spline smoothness
-                        self.create_line(points, fill=Theme.PLAYHEAD, width=2, smooth=True, splinesteps=36)
+                    p0 = max(0.0, (float(draw_left) - float(fade_out_x)) / float(fade_px))
+                    p1 = min(1.0, (float(draw_right) - float(fade_out_x)) / float(fade_px))
+                    if p1 > p0:
+                        visible_fade_px = max(1.0, (p1 - p0) * float(fade_px))
+                        steps = max(12, min(64, int(visible_fade_px) // 4))
+                        points = []
+                        for i in range(steps + 1):
+                            p = p0 + ((i / steps) * (p1 - p0))
+                            g = self._curve_gain(1.0 - p, curve)
+                            x = fade_out_x + (p * fade_px)
+                            y_pt = line_bottom - g * line_height
+                            points.extend([x, y_pt])
+                        if len(points) >= 4:
+                            # Draw shadow for depth
+                            shadow_points = [p + 1 if i % 2 == 1 else p for i, p in enumerate(points)]
+                            self.create_line(shadow_points, fill='#000000', width=3, smooth=True, splinesteps=36)
+                            # Main curve with thicker stroke and high spline smoothness
+                            self.create_line(points, fill=Theme.PLAYHEAD, width=2, smooth=True, splinesteps=36)
 
                     if is_selected and fade_px >= (curve_r * 4):
                         mid_x = fade_out_x + (fade_px / 2)
-                        mid_g = self._curve_gain(0.5, curve)
-                        mid_y = line_bottom - mid_g * line_height
-                        # Control point with outline for better visibility
-                        self.create_oval(mid_x - curve_r - 1, mid_y - curve_r - 1, mid_x + curve_r + 1, mid_y + curve_r + 1,
-                                         fill='#000000', outline='')
-                        self.create_oval(mid_x - curve_r, mid_y - curve_r, mid_x + curve_r, mid_y + curve_r,
-                                         fill=Theme.PLAYHEAD, outline=Theme.FG_HIGHLIGHT, width=1)
+                        if float(draw_left) <= float(mid_x) <= float(draw_right):
+                            mid_g = self._curve_gain(0.5, curve)
+                            mid_y = line_bottom - mid_g * line_height
+                            # Control point with outline for better visibility
+                            self.create_oval(mid_x - curve_r - 1, mid_y - curve_r - 1, mid_x + curve_r + 1, mid_y + curve_r + 1,
+                                             fill='#000000', outline='')
+                            self.create_oval(mid_x - curve_r, mid_y - curve_r, mid_x + curve_r, mid_y + curve_r,
+                                             fill=Theme.PLAYHEAD, outline=Theme.FG_HIGHLIGHT, width=1)
                 fade_out_hovered = self._hover_clip is clip and self._hover_part == 'fade_out'
                 fade_out_active = bool(self._drag_state) and self._drag_state.get('clip') is clip and self._drag_state.get('mode') == 'fade_out'
-                if fade_out_hovered or fade_out_active:
-                    glow_r_outer = r + 6
-                    glow_r_inner = r + 3
+                if float(draw_left) <= float(fade_out_x) <= float(draw_right):
+                    if fade_out_hovered or fade_out_active:
+                        glow_r_outer = r + 6
+                        glow_r_inner = r + 3
+                        self.create_oval(
+                            fade_out_x - glow_r_outer, handle_y - glow_r_outer, fade_out_x + glow_r_outer, handle_y + glow_r_outer,
+                            outline=Theme.WARNING, width=2
+                        )
+                        self.create_oval(
+                            fade_out_x - glow_r_inner, handle_y - glow_r_inner, fade_out_x + glow_r_inner, handle_y + glow_r_inner,
+                            outline=Theme.PLAYHEAD, width=2
+                        )
+                    fade_out_fill = Theme.WARNING if fade_out_active else Theme.FG_HIGHLIGHT
                     self.create_oval(
-                        fade_out_x - glow_r_outer, handle_y - glow_r_outer, fade_out_x + glow_r_outer, handle_y + glow_r_outer,
-                        outline=Theme.WARNING, width=2
+                        fade_out_x - r, handle_y - r, fade_out_x + r, handle_y + r,
+                        fill=fade_out_fill, outline=''
                     )
-                    self.create_oval(
-                        fade_out_x - glow_r_inner, handle_y - glow_r_inner, fade_out_x + glow_r_inner, handle_y + glow_r_inner,
-                        outline=Theme.PLAYHEAD, width=2
-                    )
-                fade_out_fill = Theme.WARNING if fade_out_active else Theme.FG_HIGHLIGHT
-                self.create_oval(
-                    fade_out_x - r, handle_y - r, fade_out_x + r, handle_y + r,
-                    fill=fade_out_fill, outline=''
-                )
 
         # Clip name (top left)
         clip_name = clip.get('name', 'Clip')
         if len(clip_name) > 25:
             clip_name = clip_name[:22] + '...'
         # Draw text with shadow for visibility
-        self.create_text(start_x + 6, clip_y1 + 10, text=clip_name,
+        self.create_text(draw_left + 6, clip_y1 + 10, text=clip_name,
                         anchor='w', fill='#000000', font=('Segoe UI', 8, 'bold'))
-        self.create_text(start_x + 5, clip_y1 + 9, text=clip_name,
+        self.create_text(draw_left + 5, clip_y1 + 9, text=clip_name,
                         anchor='w', fill='#ffffff', font=('Segoe UI', 8, 'bold'))
 
         # Show loading text in center if loading
         if is_loading:
-            center_x = (start_x + end_x) // 2
+            center_x = (draw_left + draw_right) // 2
             center_y = (clip_y1 + clip_y2) // 2
             self.create_text(center_x, center_y, text="Loading...",
                             fill=Theme.FG_SECONDARY, font=('Segoe UI', 10, 'italic'))
         else:
             # Duration text (top right)
             duration_text = f"{clip['duration']:.1f}s"
-            self.create_text(end_x - 6, clip_y1 + 10, text=duration_text,
+            self.create_text(draw_right - 6, clip_y1 + 10, text=duration_text,
                             anchor='e', fill='#000000', font=('Segoe UI', 8))
-            self.create_text(end_x - 5, clip_y1 + 9, text=duration_text,
+            self.create_text(draw_right - 5, clip_y1 + 9, text=duration_text,
                             anchor='e', fill='#ffffff', font=('Segoe UI', 8))
 
         # Draw slice indicator line if hovering over this clip for slicing
@@ -1784,6 +1909,7 @@ class TimelineCanvas(tk.Canvas):
             },
             'tracks': tracks_data,
             'current_tool': self._current_tool,
+            'magnet_enabled': self._magnet_enabled,
         }
 
     def load_project_data(self, data: dict, project_dir: str = None):
@@ -1805,8 +1931,9 @@ class TimelineCanvas(tk.Canvas):
         self.playhead_position = timeline_data.get('playhead_position', 0.0)
         self.scroll_offset = timeline_data.get('scroll_offset', 0)
 
-        # Load tool selection
+        # Load tool selection and magnet state
         self._current_tool = data.get('current_tool', 'select')
+        self._magnet_enabled = data.get('magnet_enabled', False)
 
         # Load tracks
         tracks_data = data.get('tracks', [])
