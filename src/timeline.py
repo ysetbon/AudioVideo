@@ -5,6 +5,7 @@ from typing import Optional, Callable, Dict, TYPE_CHECKING
 
 from .theme import Theme
 from .ui_components import draw_add_button
+from .media_info import MediaInfo
 
 if TYPE_CHECKING:
     from .audio_engine import AudioEngine
@@ -14,7 +15,7 @@ class TimelineCanvas(tk.Canvas):
     """Timeline canvas with tracks and playhead."""
 
     def __init__(self, parent, **kwargs):
-        super().__init__(parent, bg=Theme.BG_MAIN, highlightthickness=0, **kwargs)
+        super().__init__(parent, bg=Theme.BG_MAIN, highlightthickness=0, takefocus=True, **kwargs)
 
         self.pixels_per_second = 100
         self.duration = 180  # 3 minutes
@@ -45,8 +46,14 @@ class TimelineCanvas(tk.Canvas):
         self.track_height = 80  # default track height (px)
         self.min_track_height = 80
         self.max_track_height = 260
-        self.header_width = 150
+        self.tool_panel_width = 40  # Left tool panel width
+        self.header_width = 150  # Track header width (after tool panel)
         self.ruler_height = 30
+
+        # Tool selection ('select' or 'slice')
+        self._current_tool = 'select'
+        self._hovered_tool: Optional[str] = None
+        self._tool_buttons: Dict[str, tuple] = {}  # tool_name -> (x1, y1, x2, y2)
         self._track_resize_grab_px = 5
         self._track_layout: list[tuple[int, int]] = []  # (y1, y2) per track
 
@@ -72,6 +79,9 @@ class TimelineCanvas(tk.Canvas):
         # Track reorder state
         self._track_drag_insert_idx: Optional[int] = None
 
+        # Slice tool state
+        self._slice_hover_info: Optional[dict] = None  # {'track_idx': int, 'clip': dict, 'time': float, 'x': int}
+
         self._clip_edge_px = 8
         self._min_clip_duration = 0.05  # seconds
         self._fade_handle_radius = 5
@@ -88,6 +98,9 @@ class TimelineCanvas(tk.Canvas):
         self.bind('<Configure>', self._on_resize)
         self.bind('<Motion>', self._on_motion)
         self.bind('<Leave>', self._on_leave)
+        # Keyboard bindings
+        self.bind('<Delete>', self._on_delete_key)
+        self.bind('<BackSpace>', self._on_delete_key)
         # Mouse wheel zoom (Windows and Linux)
         self.bind('<MouseWheel>', self._on_mousewheel)
         self.bind('<Button-4>', self._on_mousewheel_linux)  # Linux scroll up
@@ -110,8 +123,29 @@ class TimelineCanvas(tk.Canvas):
         if self._hovered_add_button is not None:
             self._hovered_add_button = None
             self._draw()
+        if self._slice_hover_info is not None:
+            self._slice_hover_info = None
+            self._draw()
         self._set_hover_target(None, None)
         self.config(cursor='')
+
+    def _on_delete_key(self, event):
+        """Delete the currently selected clip."""
+        if self.selected_clip is None:
+            return
+
+        # Find and remove the clip from its track
+        for track_idx, track in enumerate(self.tracks):
+            clips = track.get('clips', [])
+            if self.selected_clip in clips:
+                clips.remove(self.selected_clip)
+                self.selected_clip = None
+                self._draw()
+                if self.on_clip_select:
+                    self.on_clip_select(None, None)
+                if self.on_timeline_edited:
+                    self.on_timeline_edited()
+                return
 
     def _create_default_tracks(self):
         self.tracks = [
@@ -151,8 +185,13 @@ class TimelineCanvas(tk.Canvas):
             return self._track_layout[track_idx]
         return None
 
+    @property
+    def _content_start_x(self) -> int:
+        """X position where timeline content starts (after tool panel + track headers)."""
+        return self.tool_panel_width + self.header_width
+
     def _hit_test_track_resize(self, x: int, y: int) -> Optional[int]:
-        if x > self.header_width:
+        if x < self.tool_panel_width or x > self._content_start_x:
             return None
         if len(self._track_layout) != len(self.tracks):
             self._recompute_track_layout()
@@ -164,6 +203,15 @@ class TimelineCanvas(tk.Canvas):
 
     def _on_click(self, event):
         self._drag_playhead = False
+        # Take focus so keyboard events work
+        self.focus_set()
+
+        # Check if click is on a tool button
+        for tool_name, (x1, y1, x2, y2) in self._tool_buttons.items():
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                self._current_tool = tool_name
+                self._draw()
+                return
 
         # Track height resize (drag the bottom edge of a track header)
         resize_idx = self._hit_test_track_resize(event.x, event.y)
@@ -189,18 +237,19 @@ class TimelineCanvas(tk.Canvas):
 
         # Track M/S buttons and track label drag
         track_idx = self._track_index_at_y(event.y)
-        if track_idx is not None and event.x < self.header_width:
+        if track_idx is not None and self.tool_panel_width < event.x < self._content_start_x:
             bounds = self._track_bounds(track_idx)
             if not bounds:
                 return
             track_y1, _track_y2 = bounds
-            if 12 <= event.x <= 36 and (track_y1 + 50) <= event.y <= (track_y1 + 70):
+            ms_x = self.tool_panel_width + 8
+            if ms_x <= event.x <= (ms_x + 24) and (track_y1 + 50) <= event.y <= (track_y1 + 70):
                 self.tracks[track_idx]['muted'] = not self.tracks[track_idx].get('muted', False)
                 self._draw()
                 if self.on_timeline_edited:
                     self.on_timeline_edited()
                 return
-            if 42 <= event.x <= 66 and (track_y1 + 50) <= event.y <= (track_y1 + 70):
+            if (ms_x + 30) <= event.x <= (ms_x + 54) and (track_y1 + 50) <= event.y <= (track_y1 + 70):
                 self.tracks[track_idx]['solo'] = not self.tracks[track_idx].get('solo', False)
                 self._draw()
                 if self.on_timeline_edited:
@@ -219,7 +268,7 @@ class TimelineCanvas(tk.Canvas):
                 self._draw()
                 return
 
-        # Clip selection / drag begin
+        # Clip selection / drag begin / slice
         hit = self._hit_test_clip(event.x, event.y)
         if hit:
             hit_track_idx, hit_clip, hit_part = hit
@@ -237,7 +286,7 @@ class TimelineCanvas(tk.Canvas):
             if media_duration is None and self.audio_engine and hit_clip.get('path') in self.audio_engine.loaded_audio:
                 media_duration = self.audio_engine.loaded_audio[hit_clip.get('path')].duration
 
-            clip_start_x = self.header_width + (start_time * self.pixels_per_second)
+            clip_start_x = self._content_start_x + (start_time * self.pixels_per_second)
             curve_target = None
             curve_start = None
             if hit_part in ('fade_in', 'fade_in_curve'):
@@ -254,6 +303,9 @@ class TimelineCanvas(tk.Canvas):
                 'mouse_x': event.x,
                 'mouse_y': event.y,
                 'mouse_y_start': event.y,
+                'click_x': event.x,  # Initial click position for slice detection
+                'click_y': event.y,
+                'has_dragged': False,  # Track if actual drag occurred
                 'curve_target': curve_target,
                 'curve_start': curve_start,
                 'start_time': start_time,
@@ -270,8 +322,8 @@ class TimelineCanvas(tk.Canvas):
                 self._draw()
 
         # Click anywhere in the timeline content (including ruler) moves playhead
-        if event.x > self.header_width:
-            time = (event.x - self.header_width + self.scroll_offset) / self.pixels_per_second
+        if event.x > self._content_start_x:
+            time = (event.x - self._content_start_x + self.scroll_offset) / self.pixels_per_second
             self.set_playhead(time)
             if self.on_playhead_change:
                 self.on_playhead_change(self.playhead_position)
@@ -293,11 +345,21 @@ class TimelineCanvas(tk.Canvas):
             elif self._drag_state.get('mode') == 'reorder_track':
                 self._apply_track_reorder(event.y)
             else:
-                self._apply_drag(event.x, event.y)
+                # Check if mouse moved enough to be considered a drag (3px threshold)
+                if not self._drag_state.get('has_dragged'):
+                    click_x = self._drag_state.get('click_x', event.x)
+                    click_y = self._drag_state.get('click_y', event.y)
+                    dist_sq = (event.x - click_x) ** 2 + (event.y - click_y) ** 2
+                    if dist_sq > 9:  # 3px threshold
+                        self._drag_state['has_dragged'] = True
+
+                # Only apply drag if we've actually started dragging
+                if self._drag_state.get('has_dragged'):
+                    self._apply_drag(event.x, event.y)
             return
 
-        if self._drag_playhead and event.x > self.header_width:
-            time = max(0, min(self.duration, (event.x - self.header_width + self.scroll_offset) / self.pixels_per_second))
+        if self._drag_playhead and event.x > self._content_start_x:
+            time = max(0, min(self.duration, (event.x - self._content_start_x + self.scroll_offset) / self.pixels_per_second))
             self.set_playhead(time)
             if self.on_playhead_change:
                 self.on_playhead_change(self.playhead_position)
@@ -321,6 +383,57 @@ class TimelineCanvas(tk.Canvas):
             if self.on_timeline_edited:
                 self.on_timeline_edited()
             return
+
+        # Check if this was a click (no drag) on clip body with slice tool - perform slice
+        if (self._current_tool == 'slice' and
+            self._drag_state.get('mode') == 'move' and
+            not self._drag_state.get('has_dragged')):
+            clip = self._drag_state.get('clip')
+            track_idx = self._drag_state.get('track_idx')
+
+            # Calculate slice time from click position
+            if clip and track_idx is not None:
+                track = self.tracks[track_idx]
+                track_type = track.get('type', 'audio')
+                clip_start = float(clip.get('start', 0.0))
+                clip_duration = float(clip.get('duration', 0.0))
+                click_x = self._drag_state.get('click_x', event.x)
+
+                # Calculate timeline position from click x
+                raw_time = (click_x - self._content_start_x + self.scroll_offset) / self.pixels_per_second
+
+                # For video tracks, snap to nearest frame
+                if track_type == 'video':
+                    fps = clip.get('frame_rate', 30.0)
+                    if not fps or fps <= 0:
+                        filepath = clip.get('path')
+                        if filepath:
+                            fps = MediaInfo.get_frame_rate(filepath)
+                        else:
+                            fps = 30.0
+                    frame_duration = 1.0 / fps
+                    frame_num = round(raw_time / frame_duration)
+                    slice_time = frame_num * frame_duration
+                else:
+                    # Audio: exact timing
+                    slice_time = raw_time
+
+                # Clamp to valid range within clip
+                min_slice_dist = self._min_clip_duration
+                slice_time = max(clip_start + min_slice_dist,
+                               min(slice_time, clip_start + clip_duration - min_slice_dist))
+
+                # Perform the slice
+                if self._slice_clip(track_idx, clip, slice_time):
+                    self._drag_state = None
+                    self._slice_hover_info = None
+                    self._draw()
+                    if self.on_clip_select and self.selected_clip:
+                        self.on_clip_select(self.selected_clip, track_idx)
+                    if self.on_timeline_edited:
+                        self.on_timeline_edited()
+                    return
+
         self._drag_state = None
         self._sort_all_tracks()
         self._draw()
@@ -350,7 +463,7 @@ class TimelineCanvas(tk.Canvas):
     def _on_right_click(self, event):
         """Handle right-click for context menu in track labels panel."""
         # Only show menu if clicking in the track labels area (left panel)
-        if event.x >= self.header_width:
+        if event.x >= self._content_start_x:
             return
 
         # Check if clicking on an existing track's label area
@@ -390,8 +503,26 @@ class TimelineCanvas(tk.Canvas):
         resize_idx = self._hit_test_track_resize(event.x, event.y)
         if resize_idx is not None:
             self._set_hover_target(None, None)
+            if self._hovered_tool is not None:
+                self._hovered_tool = None
+                self._draw()
             self.config(cursor='sb_v_double_arrow')
             return
+
+        # Tool button hover
+        old_hovered_tool = self._hovered_tool
+        self._hovered_tool = None
+        for tool_name, (x1, y1, x2, y2) in self._tool_buttons.items():
+            if x1 <= event.x <= x2 and y1 <= event.y <= y2:
+                self._hovered_tool = tool_name
+                if old_hovered_tool != self._hovered_tool:
+                    self._draw()
+                self._set_hover_target(None, None)
+                self.config(cursor='hand2')
+                return
+
+        if old_hovered_tool is not None and self._hovered_tool is None:
+            self._draw()
 
         # Add button hover
         for track_idx, (x1, y1, x2, y2) in self._add_buttons.items():
@@ -409,12 +540,13 @@ class TimelineCanvas(tk.Canvas):
 
         # Track M/S hover and track label drag hover
         track_idx = self._track_index_at_y(event.y)
-        if track_idx is not None and event.x < self.header_width:
+        if track_idx is not None and self.tool_panel_width < event.x < self._content_start_x:
             bounds = self._track_bounds(track_idx)
             if not bounds:
                 return
             track_y1, _track_y2 = bounds
-            if ((12 <= event.x <= 36) or (42 <= event.x <= 66)) and ((track_y1 + 50) <= event.y <= (track_y1 + 70)):
+            ms_x = self.tool_panel_width + 8
+            if ((ms_x <= event.x <= ms_x + 24) or (ms_x + 30 <= event.x <= ms_x + 54)) and ((track_y1 + 50) <= event.y <= (track_y1 + 70)):
                 self._set_hover_target(None, None)
                 self.config(cursor='hand2')
                 return
@@ -426,18 +558,73 @@ class TimelineCanvas(tk.Canvas):
 
         # Clip hover
         hit = self._hit_test_clip(event.x, event.y)
+        old_slice_info = self._slice_hover_info
+        self._slice_hover_info = None
+
         if hit:
-            _, clip, part = hit
+            track_idx, clip, part = hit
             if part in ('trim_start', 'trim_end', 'fade_in', 'fade_out'):
                 cursor = 'sb_h_double_arrow'
             elif part in ('fade_in_curve', 'fade_out_curve'):
                 cursor = 'sb_v_double_arrow'
+            elif part == 'move':
+                # Cursor depends on current tool
+                if self._current_tool == 'slice':
+                    cursor = 'crosshair'
+                    # Calculate slice position
+                    track = self.tracks[track_idx]
+                    track_type = track.get('type', 'audio')
+                    clip_start = float(clip.get('start', 0.0))
+                    clip_duration = float(clip.get('duration', 0.0))
+
+                    # Calculate timeline position from mouse x
+                    raw_time = (event.x - self._content_start_x + self.scroll_offset) / self.pixels_per_second
+
+                    # For video tracks, snap to nearest frame
+                    if track_type == 'video':
+                        fps = clip.get('frame_rate', 30.0)
+                        if not fps or fps <= 0:
+                            # Try to get from media file if we have a path
+                            filepath = clip.get('path')
+                            if filepath:
+                                fps = MediaInfo.get_frame_rate(filepath)
+                            else:
+                                fps = 30.0
+                        # Snap to nearest frame
+                        frame_duration = 1.0 / fps
+                        frame_num = round(raw_time / frame_duration)
+                        slice_time = frame_num * frame_duration
+                    else:
+                        # Audio: exact timing
+                        slice_time = raw_time
+
+                    # Clamp to valid range within clip (with minimum distance from edges)
+                    min_slice_dist = self._min_clip_duration
+                    slice_time = max(clip_start + min_slice_dist,
+                                   min(slice_time, clip_start + clip_duration - min_slice_dist))
+
+                    # Calculate x position for the slice line
+                    slice_x = self._content_start_x + int(slice_time * self.pixels_per_second) - self.scroll_offset
+
+                    self._slice_hover_info = {
+                        'track_idx': track_idx,
+                        'clip': clip,
+                        'time': slice_time,
+                        'x': slice_x
+                    }
+                else:
+                    # Select tool - show move cursor
+                    cursor = 'fleur'
             else:
                 cursor = 'fleur'
 
             if part in ('fade_in', 'fade_out'):
                 hover_clip = clip
                 hover_part = part
+
+        # Redraw if slice hover changed
+        if old_slice_info != self._slice_hover_info:
+            self._draw()
 
         self._set_hover_target(hover_clip, hover_part)
         self.config(cursor=cursor)
@@ -532,8 +719,8 @@ class TimelineCanvas(tk.Canvas):
             return None
         track_y1, track_y2 = bounds
         padding = 4
-        x1 = self.header_width + float(clip['start']) * self.pixels_per_second - self.scroll_offset
-        x2 = self.header_width + float(clip['start'] + clip['duration']) * self.pixels_per_second - self.scroll_offset
+        x1 = self._content_start_x + float(clip['start']) * self.pixels_per_second - self.scroll_offset
+        x2 = self._content_start_x + float(clip['start'] + clip['duration']) * self.pixels_per_second - self.scroll_offset
         y1 = track_y1 + padding
         y2 = track_y2 - padding
         return (x1, y1, x2, y2)
@@ -620,7 +807,7 @@ class TimelineCanvas(tk.Canvas):
         media_duration = state.get('media_duration')
 
         if mode == 'move':
-            new_start = (float(x) - self.header_width + self.scroll_offset - float(state['grab_offset_x'])) / self.pixels_per_second
+            new_start = (float(x) - self._content_start_x + self.scroll_offset - float(state['grab_offset_x'])) / self.pixels_per_second
             clip['start'] = max(0.0, new_start)
 
         elif mode == 'trim_start':
@@ -633,7 +820,7 @@ class TimelineCanvas(tk.Canvas):
             earliest_start = max(0.0, original_start - original_source_start)
             latest_start = max(0.0, original_end - self._min_clip_duration)
 
-            proposed_start = (float(x) - self.header_width + self.scroll_offset) / self.pixels_per_second
+            proposed_start = (float(x) - self._content_start_x + self.scroll_offset) / self.pixels_per_second
             proposed_start = max(earliest_start, min(proposed_start, latest_start))
 
             new_duration = max(self._min_clip_duration, original_end - proposed_start)
@@ -655,7 +842,7 @@ class TimelineCanvas(tk.Canvas):
             original_start = float(state['start_time'])
             original_source_start = float(state['source_start'])
 
-            proposed_end = (float(x) - self.header_width + self.scroll_offset) / self.pixels_per_second
+            proposed_end = (float(x) - self._content_start_x + self.scroll_offset) / self.pixels_per_second
             proposed_end = max(original_start + self._min_clip_duration, proposed_end)
 
             new_duration = proposed_end - original_start
@@ -671,7 +858,7 @@ class TimelineCanvas(tk.Canvas):
         elif mode == 'fade_in':
             clip_start = float(clip.get('start', 0.0))
             clip_duration = float(clip.get('duration', 0.0))
-            start_x = self.header_width + (clip_start * self.pixels_per_second) - self.scroll_offset
+            start_x = self._content_start_x + (clip_start * self.pixels_per_second) - self.scroll_offset
             new_fade = (float(x) - float(start_x)) / self.pixels_per_second
             clip['fade_in'] = max(0.0, min(float(new_fade), float(clip_duration)))
             if state.get('curve_target') == 'fade_in_curve' and state.get('curve_start') is not None:
@@ -682,7 +869,7 @@ class TimelineCanvas(tk.Canvas):
         elif mode == 'fade_out':
             clip_start = float(clip.get('start', 0.0))
             clip_duration = float(clip.get('duration', 0.0))
-            end_x = self.header_width + ((clip_start + clip_duration) * self.pixels_per_second) - self.scroll_offset
+            end_x = self._content_start_x + ((clip_start + clip_duration) * self.pixels_per_second) - self.scroll_offset
             new_fade = (float(end_x) - float(x)) / self.pixels_per_second
             clip['fade_out'] = max(0.0, min(float(new_fade), float(clip_duration)))
             if state.get('curve_target') == 'fade_out_curve' and state.get('curve_start') is not None:
@@ -723,6 +910,84 @@ class TimelineCanvas(tk.Canvas):
             clips = track.get('clips', [])
             if clips:
                 clips.sort(key=lambda c: float(c.get('start', 0.0)))
+
+    def _slice_clip(self, track_idx: int, clip: dict, slice_time: float) -> bool:
+        """Slice a clip at the specified time, creating two clips.
+
+        Returns True if slice was successful, False otherwise.
+        """
+        if track_idx < 0 or track_idx >= len(self.tracks):
+            return False
+
+        track = self.tracks[track_idx]
+        clips = track.get('clips', [])
+        if clip not in clips:
+            return False
+
+        clip_start = float(clip.get('start', 0.0))
+        clip_duration = float(clip.get('duration', 0.0))
+        clip_end = clip_start + clip_duration
+        source_start = float(clip.get('source_start', 0.0))
+
+        # Validate slice time is within clip bounds with minimum margins
+        min_duration = self._min_clip_duration
+        if slice_time <= clip_start + min_duration or slice_time >= clip_end - min_duration:
+            return False
+
+        # Calculate durations for left and right clips
+        left_duration = slice_time - clip_start
+        right_duration = clip_end - slice_time
+
+        # Calculate source offsets
+        left_source_start = source_start
+        right_source_start = source_start + left_duration
+
+        # Create left clip (modify original)
+        left_clip = {
+            'name': clip.get('name', 'Clip'),
+            'path': clip.get('path'),
+            'start': clip_start,
+            'duration': left_duration,
+            'source_start': left_source_start,
+            'media_duration': clip.get('media_duration'),
+            'fade_in': min(float(clip.get('fade_in', 0.0)), left_duration),
+            'fade_out': 0.0,  # No fade out on left clip
+            'fade_in_curve': clip.get('fade_in_curve', 0.0),
+            'fade_out_curve': 0.0,
+        }
+
+        # Create right clip
+        right_clip = {
+            'name': clip.get('name', 'Clip'),
+            'path': clip.get('path'),
+            'start': slice_time,
+            'duration': right_duration,
+            'source_start': right_source_start,
+            'media_duration': clip.get('media_duration'),
+            'fade_in': 0.0,  # No fade in on right clip
+            'fade_out': min(float(clip.get('fade_out', 0.0)), right_duration),
+            'fade_in_curve': 0.0,
+            'fade_out_curve': clip.get('fade_out_curve', 0.0),
+        }
+
+        # Copy optional properties if they exist
+        for key in ['frame_rate', 'loading']:
+            if key in clip:
+                left_clip[key] = clip[key]
+                right_clip[key] = clip[key]
+
+        # Remove original clip and add the two new clips
+        clips.remove(clip)
+        clips.append(left_clip)
+        clips.append(right_clip)
+
+        # Sort clips by start time
+        clips.sort(key=lambda c: float(c.get('start', 0.0)))
+
+        # Update selection to right clip
+        self.selected_clip = right_clip
+
+        return True
 
     def _curve_gain(self, t: float, curve: float) -> float:
         """Map a 0..1 ramp to a curved ramp (0=linear)."""
@@ -785,7 +1050,7 @@ class TimelineCanvas(tk.Canvas):
     def set_scroll_offset(self, percent: float):
         """Set scroll offset as percentage (0.0 to 1.0) of scrollable area."""
         total_width = self.duration * self.pixels_per_second
-        visible_width = self.winfo_width() - self.header_width
+        visible_width = self.winfo_width() - self._content_start_x
         max_scroll = max(0, total_width - visible_width)
         self.scroll_offset = int(percent * max_scroll)
         self._draw()
@@ -793,7 +1058,7 @@ class TimelineCanvas(tk.Canvas):
     def _clamp_scroll_offset(self):
         """Ensure scroll offset is within valid bounds."""
         total_width = self.duration * self.pixels_per_second
-        visible_width = max(1, self.winfo_width() - self.header_width)
+        visible_width = max(1, self.winfo_width() - self._content_start_x)
         max_scroll = max(0, total_width - visible_width)
         self.scroll_offset = max(0, min(self.scroll_offset, int(max_scroll)))
 
@@ -801,7 +1066,7 @@ class TimelineCanvas(tk.Canvas):
         """Notify callback about scroll state."""
         if self.on_scroll_update:
             total_width = self.duration * self.pixels_per_second
-            visible_width = max(1, self.winfo_width() - self.header_width)
+            visible_width = max(1, self.winfo_width() - self._content_start_x)
             max_scroll = max(1, total_width - visible_width)
             scroll_percent = self.scroll_offset / max_scroll if max_scroll > 0 else 0
             visible_percent = min(1.0, visible_width / max(1, total_width))
@@ -810,6 +1075,7 @@ class TimelineCanvas(tk.Canvas):
     def _draw(self):
         self.delete('all')
         self._add_buttons.clear()
+        self._tool_buttons.clear()
         self._playhead_line_id = None
         self._playhead_handle_id = None
         width = self.winfo_width()
@@ -818,9 +1084,14 @@ class TimelineCanvas(tk.Canvas):
         if width < 10 or height < 10:
             return
 
+        # Draw tool panel background
+        self.create_rectangle(0, 0, self.tool_panel_width, height, fill=Theme.BG_PANEL, outline='')
+
+        # Draw tool buttons
+        self._draw_tool_panel(height)
+
         # Draw ruler background
-        self.create_rectangle(0, 0, width, self.ruler_height, fill=Theme.BG_PANEL, outline='')
-        self.create_rectangle(0, 0, self.header_width, self.ruler_height, fill=Theme.BG_PANEL, outline='')
+        self.create_rectangle(self.tool_panel_width, 0, width, self.ruler_height, fill=Theme.BG_PANEL, outline='')
 
         # Draw ruler ticks and labels
         self._draw_ruler(width)
@@ -864,8 +1135,68 @@ class TimelineCanvas(tk.Canvas):
         self._draw_playhead(height)
 
         # Draw borders
-        self.create_line(self.header_width, 0, self.header_width, height, fill=Theme.BORDER)
+        self.create_line(self.tool_panel_width, 0, self.tool_panel_width, height, fill=Theme.BORDER)
+        self.create_line(self._content_start_x, 0, self._content_start_x, height, fill=Theme.BORDER)
         self.create_line(0, self.ruler_height, width, self.ruler_height, fill=Theme.BORDER)
+
+    def _draw_tool_panel(self, height: int):
+        """Draw the tool selection panel on the left side."""
+        btn_size = 28
+        btn_margin = 6
+        btn_x = (self.tool_panel_width - btn_size) // 2
+        btn_y = self.ruler_height + 10
+
+        # Select tool button (arrow icon)
+        select_active = self._current_tool == 'select'
+        select_hovered = self._hovered_tool == 'select'
+        select_bg = Theme.ACCENT if select_active else (Theme.BG_HOVER if select_hovered else Theme.BG_INPUT)
+        select_fg = Theme.FG_HIGHLIGHT if select_active else Theme.FG_SECONDARY
+
+        self.create_rectangle(btn_x, btn_y, btn_x + btn_size, btn_y + btn_size,
+                            fill=select_bg, outline=Theme.BORDER)
+        # Draw arrow/pointer icon
+        arrow_cx = btn_x + btn_size // 2
+        arrow_cy = btn_y + btn_size // 2
+        self.create_polygon(
+            arrow_cx - 6, arrow_cy - 8,
+            arrow_cx + 6, arrow_cy,
+            arrow_cx - 2, arrow_cy,
+            arrow_cx - 2, arrow_cy + 8,
+            arrow_cx - 6, arrow_cy + 8,
+            arrow_cx - 6, arrow_cy - 8,
+            fill=select_fg, outline=''
+        )
+        self._tool_buttons['select'] = (btn_x, btn_y, btn_x + btn_size, btn_y + btn_size)
+
+        # Slice tool button (blade/cut icon)
+        btn_y += btn_size + btn_margin
+        slice_active = self._current_tool == 'slice'
+        slice_hovered = self._hovered_tool == 'slice'
+        slice_bg = Theme.ACCENT if slice_active else (Theme.BG_HOVER if slice_hovered else Theme.BG_INPUT)
+        slice_fg = Theme.FG_HIGHLIGHT if slice_active else Theme.FG_SECONDARY
+
+        self.create_rectangle(btn_x, btn_y, btn_x + btn_size, btn_y + btn_size,
+                            fill=slice_bg, outline=Theme.BORDER)
+        # Draw blade/cut icon (vertical line with triangles)
+        blade_cx = btn_x + btn_size // 2
+        blade_cy = btn_y + btn_size // 2
+        self.create_line(blade_cx, btn_y + 5, blade_cx, btn_y + btn_size - 5,
+                        fill=slice_fg, width=2)
+        # Top triangle
+        self.create_polygon(
+            blade_cx - 4, btn_y + 6,
+            blade_cx + 4, btn_y + 6,
+            blade_cx, btn_y + 10,
+            fill=slice_fg, outline=''
+        )
+        # Bottom triangle
+        self.create_polygon(
+            blade_cx - 4, btn_y + btn_size - 6,
+            blade_cx + 4, btn_y + btn_size - 6,
+            blade_cx, btn_y + btn_size - 10,
+            fill=slice_fg, outline=''
+        )
+        self._tool_buttons['slice'] = (btn_x, btn_y, btn_x + btn_size, btn_y + btn_size)
 
     def _draw_ruler(self, width):
         # Determine tick interval
@@ -889,10 +1220,10 @@ class TimelineCanvas(tk.Canvas):
 
         t = start_time
         while t <= self.duration:
-            x = self.header_width + int(t * self.pixels_per_second) - self.scroll_offset
+            x = self._content_start_x + int(t * self.pixels_per_second) - self.scroll_offset
             if x > width:
                 break
-            if x < self.header_width:
+            if x < self._content_start_x:
                 t += minor
                 continue
 
@@ -910,38 +1241,41 @@ class TimelineCanvas(tk.Canvas):
             t += minor
 
     def _draw_track(self, track, y, width, track_idx, track_height: int):
-        # Track header
-        self.create_rectangle(0, y, self.header_width, y + track_height,
+        # Track header (starts after tool panel)
+        self.create_rectangle(self.tool_panel_width, y, self._content_start_x, y + track_height,
                             fill=Theme.BG_PANEL, outline='')
 
         # Color indicator
-        self.create_rectangle(0, y, 4, y + track_height, fill=track['color'], outline='')
+        self.create_rectangle(self.tool_panel_width, y, self.tool_panel_width + 4, y + track_height,
+                            fill=track['color'], outline='')
 
         # Track name
-        self.create_text(12, y + 12, text=track['name'], anchor='w',
+        hdr_x = self.tool_panel_width + 8
+        self.create_text(hdr_x, y + 12, text=track['name'], anchor='w',
                         fill=Theme.FG_HIGHLIGHT, font=('Segoe UI', 11, 'bold'))
-        self.create_text(12, y + 30, text=track['type'].capitalize(), anchor='w',
+        self.create_text(hdr_x, y + 30, text=track['type'].capitalize(), anchor='w',
                         fill=Theme.FG_SECONDARY, font=('Segoe UI', 9))
 
         # M/S buttons
         m_color = Theme.ERROR if track['muted'] else Theme.BG_INPUT
         s_color = Theme.WARNING if track['solo'] else Theme.BG_INPUT
 
-        self.create_rectangle(12, y + 50, 36, y + 70, fill=m_color, outline=Theme.BORDER)
-        self.create_text(24, y + 60, text='M', fill=Theme.FG_HIGHLIGHT, font=('Segoe UI', 9, 'bold'))
+        ms_x = self.tool_panel_width + 8
+        self.create_rectangle(ms_x, y + 50, ms_x + 24, y + 70, fill=m_color, outline=Theme.BORDER)
+        self.create_text(ms_x + 12, y + 60, text='M', fill=Theme.FG_HIGHLIGHT, font=('Segoe UI', 9, 'bold'))
 
-        self.create_rectangle(42, y + 50, 66, y + 70, fill=s_color, outline=Theme.BORDER)
-        self.create_text(54, y + 60, text='S', fill=Theme.FG_HIGHLIGHT, font=('Segoe UI', 9, 'bold'))
+        self.create_rectangle(ms_x + 30, y + 50, ms_x + 54, y + 70, fill=s_color, outline=Theme.BORDER)
+        self.create_text(ms_x + 42, y + 60, text='S', fill=Theme.FG_HIGHLIGHT, font=('Segoe UI', 9, 'bold'))
 
         # Add media button (+) - professional rounded design
-        btn_x1, btn_y1 = 90, y + 50
-        btn_x2, btn_y2 = 140, y + 72
+        btn_x1, btn_y1 = ms_x + 60, y + 50
+        btn_x2, btn_y2 = ms_x + 110, y + 72
         is_hovered = self._hovered_add_button == track_idx
         draw_add_button(self, btn_x1, btn_y1, btn_x2, btn_y2, hovered=is_hovered)
         self._add_buttons[track_idx] = (btn_x1, btn_y1, btn_x2, btn_y2)
 
         # Track content area
-        self.create_rectangle(self.header_width, y, width, y + track_height,
+        self.create_rectangle(self._content_start_x, y, width, y + track_height,
                             fill=Theme.BG_MAIN, outline='')
 
         # Grid lines
@@ -950,10 +1284,10 @@ class TimelineCanvas(tk.Canvas):
         start_time = (start_time // major) * major
         t = start_time
         while t <= self.duration:
-            x = self.header_width + int(t * self.pixels_per_second) - self.scroll_offset
+            x = self._content_start_x + int(t * self.pixels_per_second) - self.scroll_offset
             if x > width:
                 break
-            if x >= self.header_width:
+            if x >= self._content_start_x:
                 self.create_line(x, y, x, y + track_height, fill=Theme.BG_HOVER)
             t += major
 
@@ -966,18 +1300,18 @@ class TimelineCanvas(tk.Canvas):
 
         # "Drop media" hint (only if no clips)
         if not track.get('clips'):
-            center_x = self.header_width + (width - self.header_width) // 2
+            center_x = self._content_start_x + (width - self._content_start_x) // 2
             center_y = y + track_height // 2
             self.create_text(center_x, center_y, text="Click + to add media",
                             fill=Theme.FG_DISABLED, font=('Segoe UI', 10))
 
     def _draw_clip(self, clip, track, y, width, track_height: int):
         """Draw a media clip on the track with waveform."""
-        start_x = self.header_width + int(clip['start'] * self.pixels_per_second) - self.scroll_offset
-        end_x = self.header_width + int((clip['start'] + clip['duration']) * self.pixels_per_second) - self.scroll_offset
+        start_x = self._content_start_x + int(clip['start'] * self.pixels_per_second) - self.scroll_offset
+        end_x = self._content_start_x + int((clip['start'] + clip['duration']) * self.pixels_per_second) - self.scroll_offset
 
         # Skip drawing if clip is completely outside visible area
-        if end_x < self.header_width or start_x > width:
+        if end_x < self._content_start_x or start_x > width:
             return
         if end_x <= start_x + 2:
             end_x = start_x + 2
@@ -1155,6 +1489,29 @@ class TimelineCanvas(tk.Canvas):
             self.create_text(end_x - 5, clip_y1 + 9, text=duration_text,
                             anchor='e', fill='#ffffff', font=('Segoe UI', 8))
 
+        # Draw slice indicator line if hovering over this clip for slicing
+        if (self._slice_hover_info and
+            self._slice_hover_info.get('clip') is clip and
+            not is_loading):
+            slice_x = self._slice_hover_info.get('x', 0)
+            # Draw slice indicator line
+            self.create_line(slice_x, clip_y1 + 2, slice_x, clip_y2 - 2,
+                            fill='#ff6b6b', width=2, tags=('slice_indicator',))
+            # Draw small triangles at top and bottom
+            tri_size = 5
+            self.create_polygon(
+                slice_x - tri_size, clip_y1 + 2,
+                slice_x + tri_size, clip_y1 + 2,
+                slice_x, clip_y1 + 2 + tri_size,
+                fill='#ff6b6b', outline='', tags=('slice_indicator',)
+            )
+            self.create_polygon(
+                slice_x - tri_size, clip_y2 - 2,
+                slice_x + tri_size, clip_y2 - 2,
+                slice_x, clip_y2 - 2 - tri_size,
+                fill='#ff6b6b', outline='', tags=('slice_indicator',)
+            )
+
     def _draw_waveform(self, clip, track, start_x, clip_y, clip_width, clip_height):
         """Draw simplified waveform inside clip."""
         filepath = clip.get('path')
@@ -1167,7 +1524,7 @@ class TimelineCanvas(tk.Canvas):
         end_x = start_x + int(clip_width)
         canvas_width = self.winfo_width()
 
-        visible_x1 = max(start_x, self.header_width)
+        visible_x1 = max(start_x, self._content_start_x)
         visible_x2 = min(end_x, canvas_width)
         visible_width = int(visible_x2 - visible_x1)
         if visible_width < 10:
@@ -1234,10 +1591,10 @@ class TimelineCanvas(tk.Canvas):
         if self.play_start_position is None:
             return
 
-        x = self.header_width + int(round(self.play_start_position * self.pixels_per_second)) - self.scroll_offset
+        x = self._content_start_x + int(round(self.play_start_position * self.pixels_per_second)) - self.scroll_offset
 
         # Don't draw if outside visible area
-        if x < self.header_width or x > self.winfo_width():
+        if x < self._content_start_x or x > self.winfo_width():
             return
 
         # Use a bright cyan/teal color for visibility
@@ -1262,7 +1619,7 @@ class TimelineCanvas(tk.Canvas):
         if height < 1:
             return
 
-        x = self.header_width + int(round(self.playhead_position * self.pixels_per_second)) - self.scroll_offset
+        x = self._content_start_x + int(round(self.playhead_position * self.pixels_per_second)) - self.scroll_offset
         if self._playhead_line_id is None:
             self._playhead_line_id = self.create_line(
                 x, 0, x, height,

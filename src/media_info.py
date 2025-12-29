@@ -67,3 +67,28 @@ class MediaInfo:
                 height = stream.get('height', 0)
                 return (width, height)
         return (0, 0)
+
+    @staticmethod
+    def get_frame_rate(filepath: str) -> float:
+        """Get video frame rate. Returns fps or 30.0 as default."""
+        info = MediaInfo.get_info(filepath)
+        for stream in info.get('streams', []):
+            if stream.get('codec_type') == 'video':
+                # Try r_frame_rate first (real frame rate), then avg_frame_rate
+                r_frame_rate = stream.get('r_frame_rate', '')
+                avg_frame_rate = stream.get('avg_frame_rate', '')
+
+                for rate_str in [r_frame_rate, avg_frame_rate]:
+                    if rate_str and '/' in rate_str:
+                        try:
+                            num, den = rate_str.split('/')
+                            if int(den) != 0:
+                                return float(int(num)) / float(int(den))
+                        except (ValueError, ZeroDivisionError):
+                            continue
+                    elif rate_str:
+                        try:
+                            return float(rate_str)
+                        except ValueError:
+                            continue
+        return 30.0  # Default frame rate
