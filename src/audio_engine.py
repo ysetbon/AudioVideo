@@ -3,6 +3,7 @@ import sys
 import os
 import subprocess
 import threading
+import math
 from typing import Optional, Callable, Dict
 import numpy as np
 
@@ -106,7 +107,46 @@ class LoadedAudio:
         end_idx = max(start_idx + 1, min(end_idx, overview_len))
 
         segment = self.waveform_overview[start_idx:end_idx]
-        return self._resample_overview(segment, width)
+        # If the overview segment has enough resolution, resample it.
+        # Otherwise, compute min/max buckets directly from samples for crisp zoomed-in rendering.
+        if len(segment) >= width:
+            return self._resample_overview(segment, width)
+
+        return self._compute_waveform_from_samples(width, start_time, end_time)
+
+    def _compute_waveform_from_samples(self, width: int, start_time: float, end_time: float) -> list:
+        """Compute waveform min/max buckets directly from decoded samples."""
+        if width <= 0:
+            return []
+
+        start_sample = int(start_time * self.sample_rate)
+        end_sample = int(end_time * self.sample_rate)
+        start_sample = max(0, min(start_sample, len(self.samples)))
+        end_sample = max(start_sample + 1, min(end_sample, len(self.samples)))
+
+        segment = self.samples[start_sample:end_sample]
+        if segment.size == 0:
+            return [(0.0, 0.0)]
+
+        if len(segment.shape) > 1 and segment.shape[1] > 1:
+            mono = np.mean(segment, axis=1, dtype=np.float32)
+        else:
+            mono = segment.astype(np.float32, copy=False).reshape(-1)
+
+        length = int(mono.shape[0])
+        if length <= 0:
+            return [(0.0, 0.0)]
+
+        bucket_size = max(1, int(math.ceil(length / float(width))))
+        padded_len = bucket_size * int(width)
+        if padded_len != length:
+            pad_value = float(mono[-1])
+            mono = np.pad(mono, (0, padded_len - length), mode='constant', constant_values=pad_value)
+
+        reshaped = mono.reshape(int(width), bucket_size)
+        mins = np.min(reshaped, axis=1)
+        maxs = np.max(reshaped, axis=1)
+        return list(zip(mins.tolist(), maxs.tolist()))
 
     def get_samples_at(self, start_time: float, num_samples: int) -> np.ndarray:
         """Get audio samples starting at a specific time."""
@@ -323,6 +363,65 @@ class AudioEngine:
             return np.power(t, power)
         return one - np.power(one - t, power)
 
+    def _get_envelope_gains(self, envelope: list, clip_offset: int, num_frames: int,
+                            sample_rate: float, clip_duration: float) -> np.ndarray:
+        """Calculate volume gains from envelope for a range of frames.
+
+        Args:
+            envelope: List of {'time': float, 'volume': float} points
+            clip_offset: Frame offset within the clip (0 = start of clip)
+            num_frames: Number of frames to generate gains for
+            sample_rate: Sample rate in Hz
+            clip_duration: Total clip duration in seconds
+
+        Returns:
+            numpy array of gain values (0.0 to 1.0)
+        """
+        gains = np.ones(num_frames, dtype=np.float32)
+
+        if not envelope or len(envelope) < 2:
+            return gains
+
+        # Convert frame positions to time
+        start_time = clip_offset / sample_rate
+        end_time = (clip_offset + num_frames) / sample_rate
+
+        # Find relevant envelope segments
+        for i in range(len(envelope) - 1):
+            p1 = envelope[i]
+            p2 = envelope[i + 1]
+
+            t1 = float(p1.get('time', 0.0))
+            v1 = float(p1.get('volume', 1.0))
+            t2 = float(p2.get('time', clip_duration))
+            v2 = float(p2.get('volume', 1.0))
+
+            # Skip if segment doesn't overlap with our range
+            if t2 <= start_time or t1 >= end_time:
+                continue
+
+            # Calculate which frames this segment affects
+            seg_start = max(0, int((t1 - start_time) * sample_rate))
+            seg_end = min(num_frames, int((t2 - start_time) * sample_rate))
+
+            if seg_end <= seg_start:
+                continue
+
+            # Generate linear interpolated gains for this segment
+            seg_frames = seg_end - seg_start
+            if t2 > t1:
+                # Interpolation factor for each frame
+                frame_times = start_time + (seg_start + np.arange(seg_frames, dtype=np.float32)) / sample_rate
+                t_interp = (frame_times - t1) / (t2 - t1)
+                t_interp = np.clip(t_interp, 0.0, 1.0)
+                seg_gains = v1 + t_interp * (v2 - v1)
+            else:
+                seg_gains = np.full(seg_frames, v1, dtype=np.float32)
+
+            gains[seg_start:seg_end] = np.clip(seg_gains, 0.0, 1.0)
+
+        return gains
+
     def set_clips(self, clips: list):
         """Set the clips to play. Each clip should have 'path', 'start', 'duration'."""
         with self._lock:
@@ -354,6 +453,9 @@ class AudioEngine:
                 fade_in = max(0.0, min(fade_in, duration))
                 fade_out = max(0.0, min(fade_out, duration))
 
+                # Get volume envelope if present
+                volume_envelope = clip.get('volume_envelope')
+
                 self._active_clips.append({
                     'audio': self.loaded_audio[filepath],
                     'start': start,
@@ -368,6 +470,7 @@ class AudioEngine:
                     'source_start_frame': int(round(source_start * self.sample_rate)),
                     'fade_in_frames': int(round(fade_in * self.sample_rate)),
                     'fade_out_frames': int(round(fade_out * self.sample_rate)),
+                    'volume_envelope': volume_envelope,
                 })
 
     def _audio_callback(self, outdata, frames, time_info, status):
@@ -406,9 +509,16 @@ class AudioEngine:
                 fade_in_frames = int(clip.get('fade_in_frames', 0) or 0)
                 fade_out_frames = int(clip.get('fade_out_frames', 0) or 0)
                 duration_frames = int(clip.get('duration_frames', 0) or 0)
+                volume_envelope = clip.get('volume_envelope')
+
+                # Initialize gains array
+                gains = np.ones(frames_to_mix, dtype=np.float32)
+                apply_gains = False
+
+                # Apply fade in/out
                 if duration_frames > 0 and (fade_in_frames > 0 or fade_out_frames > 0):
                     positions = clip_offset + np.arange(frames_to_mix, dtype=np.float32)
-                    gains = np.ones(frames_to_mix, dtype=np.float32)
+                    apply_gains = True
 
                     if fade_in_frames > 0:
                         t_in = np.clip(positions / fade_in_frames, 0.0, 1.0)
@@ -418,6 +528,18 @@ class AudioEngine:
                         t_out = np.clip(remaining / fade_out_frames, 0.0, 1.0)
                         gains = np.minimum(gains, self._apply_fade_curve(t_out, clip.get('fade_out_curve', 0.0)))
 
+                # Apply volume envelope
+                if volume_envelope and len(volume_envelope) >= 2 and duration_frames > 0:
+                    apply_gains = True
+                    clip_duration = float(clip.get('duration', 0.0))
+                    if clip_duration > 0:
+                        envelope_gains = self._get_envelope_gains(
+                            volume_envelope, clip_offset, frames_to_mix,
+                            self.sample_rate, clip_duration
+                        )
+                        gains = gains * envelope_gains
+
+                if apply_gains:
                     samples = samples * gains[:, None]
 
                 mixed[out_offset:out_offset + frames_to_mix] += samples

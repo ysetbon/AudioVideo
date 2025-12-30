@@ -102,6 +102,7 @@ class WaveSyncApp:
         file_menu.add_command(label="Import Media...", accelerator="Ctrl+I", command=self._on_import)
         file_menu.add_command(label="Export...", accelerator="Ctrl+E", command=self._on_export)
         file_menu.add_command(label="Export Audio Only...", command=self._on_export_audio_only)
+        file_menu.add_command(label="Export to Adobe Audition (.sesx)...", command=self._on_export_audition)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", accelerator="Alt+F4", command=self._on_close)
 
@@ -229,6 +230,7 @@ class WaveSyncApp:
         self.timeline.on_clip_select = self._on_clip_select
         self.timeline.on_add_video_track = self._on_add_video_track
         self.timeline.on_add_audio_track = self._on_add_audio_track
+        self.timeline.on_play_pause = self._on_play_pause
         self.timeline.audio_engine = self.audio_engine
 
         # Horizontal scrollbar for timeline
@@ -266,7 +268,8 @@ class WaveSyncApp:
         ttk.Label(status_frame, text="48000 Hz | Stereo", style='Panel.TLabel').pack(side='right', padx=10, pady=4)
 
     def _setup_bindings(self):
-        self.root.bind('<space>', lambda e: self._on_play_pause())
+        # Spacebar ALWAYS triggers play/pause, nothing else
+        self.root.bind_all('<space>', self._on_space_key)
         self.root.bind('<Escape>', lambda e: self._on_stop())
         self.root.bind('<Left>', lambda e: self._on_skip_back())
         self.root.bind('<Right>', lambda e: self._on_skip_forward())
@@ -449,6 +452,11 @@ class WaveSyncApp:
             print(f"Display error: {e}")
 
     # Playback controls
+    def _on_space_key(self, event):
+        """Handle spacebar - ALWAYS play/pause, prevent any other action."""
+        self._on_play_pause()
+        return "break"  # Prevent spacebar from triggering buttons, typing in fields, etc.
+
     def _on_play_pause(self):
         if self.is_playing:
             self._pause()
@@ -593,7 +601,6 @@ class WaveSyncApp:
             step = max(10, int(current * 0.15))
         new_val = min(1000, current + step)
         self.zoom_scale.set(new_val)
-        self._on_zoom_change(new_val)
 
     def _on_zoom_out(self, step: int = None):
         current = self.zoom_scale.get()
@@ -602,11 +609,9 @@ class WaveSyncApp:
             step = max(10, int(current * 0.15))
         new_val = max(5, current - step)
         self.zoom_scale.set(new_val)
-        self._on_zoom_change(new_val)
 
     def _on_zoom_fit(self):
         self.zoom_scale.set(100)
-        self._on_zoom_change(100)
 
     def _on_zoom_wheel(self, delta: int):
         """Handle mouse wheel zoom from timeline."""
@@ -885,6 +890,258 @@ class WaveSyncApp:
 
         self._export_wav(filepath, audio_only=True)
 
+    def _on_export_audition(self):
+        """Export session to Adobe Audition .sesx format."""
+        filepath = filedialog.asksaveasfilename(
+            title="Export to Adobe Audition",
+            defaultextension=".sesx",
+            filetypes=[("Adobe Audition Session", "*.sesx"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return
+
+        root, ext = os.path.splitext(filepath)
+        ext = ext.lower()
+        if not ext:
+            filepath = filepath + ".sesx"
+
+        self._export_sesx(filepath)
+
+    def _export_sesx(self, filepath: str):
+        """Export session to Adobe Audition .sesx format."""
+        try:
+            sample_rate = int(self.audio_engine.sample_rate)
+
+            # Get all tracks with audio clips
+            tracks_data = self.timeline.tracks
+
+            # Collect all unique audio files and assign IDs
+            file_map = {}  # path -> fileID
+            file_id_counter = 1
+
+            for track in tracks_data:
+                for clip in track.get('clips', []):
+                    path = clip.get('path')
+                    if path and path not in file_map:
+                        file_map[path] = file_id_counter
+                        file_id_counter += 1
+
+            if not file_map:
+                messagebox.showinfo("Export", "No audio clips to export.")
+                return
+
+            # Calculate total duration in samples
+            max_end_time = 0.0
+            for track in tracks_data:
+                for clip in track.get('clips', []):
+                    clip_end = float(clip.get('start', 0.0)) + float(clip.get('duration', 0.0))
+                    max_end_time = max(max_end_time, clip_end)
+
+            total_samples = int(max_end_time * sample_rate) + sample_rate  # Add 1 second buffer
+
+            # Build XML
+            import xml.etree.ElementTree as ET
+            from xml.dom import minidom
+
+            # Create root element
+            sesx = ET.Element('sesx', {'version': '1.4'})
+
+            # Session element
+            session = ET.SubElement(sesx, 'session', {
+                'appBuild': '14.0.0.0',
+                'appVersion': '14.0',
+                'audioChannelType': 'stereo',
+                'bitDepth': '32',
+                'duration': str(total_samples),
+                'sampleRate': str(sample_rate)
+            })
+
+            # Name element
+            name_elem = ET.SubElement(session, 'name')
+            session_name = os.path.splitext(os.path.basename(filepath))[0]
+            name_elem.text = session_name
+
+            # Files section
+            files = ET.SubElement(session, 'files')
+            for path, file_id in file_map.items():
+                abs_path = os.path.abspath(path)
+                file_elem = ET.SubElement(files, 'file', {
+                    'id': str(file_id),
+                    'relativePath': '',
+                    'absolutePath': abs_path
+                })
+
+            # Tracks section
+            tracks_elem = ET.SubElement(session, 'tracks')
+
+            clip_id_counter = 0
+            for track_idx, track in enumerate(tracks_data):
+                if track.get('type') != 'audio':
+                    continue
+
+                audio_track = ET.SubElement(tracks_elem, 'audioTrack', {
+                    'automationLaneOpenState': '0',
+                    'id': str(track_idx),
+                    'index': str(track_idx),
+                    'select': 'false',
+                    'visible': 'true'
+                })
+
+                # Track parameters
+                track_params = ET.SubElement(audio_track, 'trackParameters', {
+                    'name': track.get('name', f'Track {track_idx + 1}'),
+                    'trackHue': '-1',
+                    'trackHeight': '150'
+                })
+
+                # Track audio parameters
+                is_muted = track.get('muted', False)
+                is_solo = track.get('solo', False)
+                track_audio_params = ET.SubElement(audio_track, 'trackAudioParameters', {
+                    'audioChannelType': 'stereo',
+                    'automationMode': 'read',
+                    'monitoring': 'false',
+                    'recordArmed': 'false',
+                    'solo': 'true' if is_solo else 'false',
+                    'soloSafe': 'false'
+                })
+
+                # Mute component
+                mute_component = ET.SubElement(track_audio_params, 'component', {
+                    'componentID': 'Audition.Mute',
+                    'id': '0',
+                    'name': 'mute'
+                })
+                mute_param = ET.SubElement(mute_component, 'parameter', {
+                    'index': '0',
+                    'name': 'mute',
+                    'parameterValue': '1' if is_muted else '0'
+                })
+
+                # Volume component for track
+                vol_component = ET.SubElement(track_audio_params, 'component', {
+                    'componentID': 'Audition.Fader',
+                    'id': '1',
+                    'name': 'volume'
+                })
+                vol_param = ET.SubElement(vol_component, 'parameter', {
+                    'index': '0',
+                    'name': 'volume',
+                    'parameterValue': '1.0'
+                })
+
+                # Clips
+                for clip in track.get('clips', []):
+                    path = clip.get('path')
+                    if not path or path not in file_map:
+                        continue
+
+                    file_id = file_map[path]
+                    start_time = float(clip.get('start', 0.0))
+                    duration = float(clip.get('duration', 0.0))
+                    source_start = float(clip.get('source_start', 0.0))
+
+                    # Convert to samples
+                    start_sample = int(start_time * sample_rate)
+                    end_sample = int((start_time + duration) * sample_rate)
+                    source_in_sample = int(source_start * sample_rate)
+                    source_out_sample = int((source_start + duration) * sample_rate)
+
+                    audio_clip = ET.SubElement(audio_track, 'audioClip', {
+                        'clipAutoCrossfade': 'false',
+                        'crossFadeHeadClipID': '-1',
+                        'crossFadeTailClipID': '-1',
+                        'endPoint': str(end_sample),
+                        'fileID': str(file_id),
+                        'hue': '-1',
+                        'id': str(clip_id_counter),
+                        'lockedInTime': 'false',
+                        'looped': 'false',
+                        'name': clip.get('name', os.path.basename(path)),
+                        'offline': 'false',
+                        'select': 'false',
+                        'sourceInPoint': str(source_in_sample),
+                        'sourceOutPoint': str(source_out_sample),
+                        'startPoint': str(start_sample),
+                        'zOrder': str(clip_id_counter)
+                    })
+
+                    # Fade in
+                    fade_in = float(clip.get('fade_in', 0.0))
+                    if fade_in > 0:
+                        fade_in_samples = int(fade_in * sample_rate)
+                        fade_in_elem = ET.SubElement(audio_clip, 'fadeIn', {
+                            'endPoint': str(fade_in_samples),
+                            'startPoint': '0',
+                            'type': 'linear'
+                        })
+
+                    # Fade out
+                    fade_out = float(clip.get('fade_out', 0.0))
+                    if fade_out > 0:
+                        fade_out_samples = int(fade_out * sample_rate)
+                        duration_samples = int(duration * sample_rate)
+                        fade_out_elem = ET.SubElement(audio_clip, 'fadeOut', {
+                            'endPoint': str(duration_samples),
+                            'startPoint': str(duration_samples - fade_out_samples),
+                            'type': 'linear'
+                        })
+
+                    # Clip audio parameters (for volume envelope)
+                    clip_audio_params = ET.SubElement(audio_clip, 'clipAudioParameters')
+
+                    # Volume envelope as automation
+                    envelope = clip.get('volume_envelope')
+                    if envelope and len(envelope) >= 2:
+                        vol_comp = ET.SubElement(clip_audio_params, 'component', {
+                            'componentID': 'Audition.Fader',
+                            'id': '0',
+                            'name': 'volume'
+                        })
+                        vol_param = ET.SubElement(vol_comp, 'parameter', {
+                            'index': '0',
+                            'name': 'volume',
+                            'parameterValue': str(float(envelope[0].get('volume', 1.0)))
+                        })
+
+                        # Add keyframes
+                        keyframes = ET.SubElement(vol_param, 'parameterKeyframes')
+                        for point in envelope:
+                            point_time = float(point.get('time', 0.0))
+                            point_vol = float(point.get('volume', 1.0))
+                            sample_offset = int(point_time * sample_rate)
+
+                            keyframe = ET.SubElement(keyframes, 'parameterKeyframe', {
+                                'sampleOffset': str(sample_offset),
+                                'type': 'linear',
+                                'value': str(point_vol)
+                            })
+
+                    clip_id_counter += 1
+
+            # Convert to string with pretty formatting
+            xml_str = ET.tostring(sesx, encoding='unicode')
+            dom = minidom.parseString(xml_str)
+            pretty_xml = dom.toprettyxml(indent='  ')
+
+            # Remove extra blank lines and fix declaration
+            lines = pretty_xml.split('\n')
+            lines = [line for line in lines if line.strip()]
+            # Replace XML declaration with doctype
+            lines[0] = '<?xml version="1.0" encoding="UTF-8"?>'
+            lines.insert(1, '<!DOCTYPE sesx>')
+
+            # Write file
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+
+            self.status_label.config(text=f"Exported to Audition: {os.path.basename(filepath)}")
+            messagebox.showinfo("Export", f"Adobe Audition session exported to:\n{filepath}")
+
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e))
+            self.status_label.config(text="Export failed")
+
     def _export_wav(self, filepath: str, audio_only: bool = False):
         mode = "Audio Only" if audio_only else "WAV"
         self.status_label.config(text=f"Exporting {mode}: {os.path.basename(filepath)}")
@@ -948,11 +1205,13 @@ class WaveSyncApp:
                     'audio': loaded,
                     'start_frame': int(round(start * sample_rate)),
                     'duration_frames': duration_frames,
+                    'duration': duration,
                     'source_start_frame': int(round(source_start * sample_rate)),
                     'fade_in_frames': int(round(fade_in * sample_rate)),
                     'fade_out_frames': int(round(fade_out * sample_rate)),
                     'fade_in_curve': fade_in_curve,
                     'fade_out_curve': fade_out_curve,
+                    'volume_envelope': clip.get('volume_envelope'),
                 })
 
             if not clip_specs or end_time <= 0:
@@ -997,9 +1256,16 @@ class WaveSyncApp:
                         fade_in_frames = int(spec.get('fade_in_frames', 0) or 0)
                         fade_out_frames = int(spec.get('fade_out_frames', 0) or 0)
                         duration_frames = int(spec.get('duration_frames', 0) or 0)
+                        volume_envelope = spec.get('volume_envelope')
+
+                        # Initialize gains array
+                        gains = np.ones(frames_to_mix, dtype=np.float32)
+                        apply_gains = False
+
+                        # Apply fades
                         if duration_frames > 0 and (fade_in_frames > 0 or fade_out_frames > 0):
                             positions = clip_offset + np.arange(frames_to_mix, dtype=np.float32)
-                            gains = np.ones(frames_to_mix, dtype=np.float32)
+                            apply_gains = True
 
                             if fade_in_frames > 0:
                                 t_in = np.clip(positions / fade_in_frames, 0.0, 1.0)
@@ -1009,6 +1275,18 @@ class WaveSyncApp:
                                 t_out = np.clip(remaining / fade_out_frames, 0.0, 1.0)
                                 gains = np.minimum(gains, AudioEngine._apply_fade_curve(t_out, spec.get('fade_out_curve', 0.0)))
 
+                        # Apply volume envelope
+                        if volume_envelope and len(volume_envelope) >= 2 and duration_frames > 0:
+                            apply_gains = True
+                            clip_duration = float(spec.get('duration', 0.0))
+                            if clip_duration > 0:
+                                envelope_gains = self.audio_engine._get_envelope_gains(
+                                    volume_envelope, clip_offset, frames_to_mix,
+                                    sample_rate, clip_duration
+                                )
+                                gains = gains * envelope_gains
+
+                        if apply_gains:
                             samples = samples * gains[:, None]
 
                         mixed[out_offset:out_offset + frames_to_mix] += samples

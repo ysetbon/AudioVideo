@@ -32,6 +32,7 @@ class TimelineCanvas(tk.Canvas):
         self.on_scroll_update: Optional[Callable[[float, float], None]] = None  # (scroll_percent, visible_percent)
         self.on_add_video_track: Optional[Callable[[], None]] = None
         self.on_add_audio_track: Optional[Callable[[], None]] = None
+        self.on_play_pause: Optional[Callable[[], None]] = None  # Spacebar play/pause
 
         # Horizontal scroll offset (in pixels)
         self.scroll_offset = 0
@@ -99,6 +100,18 @@ class TimelineCanvas(tk.Canvas):
         self._fade_handle_radius = 5
         self._fade_handle_y_offset = 14
 
+        # Volume envelope state
+        self._envelope_point_radius = 5
+        self._envelope_line_hit_tolerance = 6  # pixels
+        self._hovered_envelope_point: Optional[dict] = None  # {'clip': clip, 'point_idx': int}
+        self._hovered_envelope_line: Optional[dict] = None  # {'clip': clip, 'time': float}
+
+        # View scaling for envelope/waveform visuals
+        self._envelope_zoom = 1.0  # 1.0 = full 0..1 range, >1 zooms into the top range
+        self._min_envelope_zoom = 1.0
+        self._max_envelope_zoom = 16.0
+        self._envelope_zoom_step = 1.15
+
         # Create default tracks
         self._create_default_tracks()
 
@@ -113,6 +126,7 @@ class TimelineCanvas(tk.Canvas):
         # Keyboard bindings
         self.bind('<Delete>', self._on_delete_key)
         self.bind('<BackSpace>', self._on_delete_key)
+        self.bind('<space>', self._on_space_key)
         # Mouse wheel zoom (Windows and Linux)
         self.bind('<MouseWheel>', self._on_mousewheel)
         self.bind('<Button-4>', self._on_mousewheel_linux)  # Linux scroll up
@@ -140,6 +154,12 @@ class TimelineCanvas(tk.Canvas):
             self._draw()
         self._set_hover_target(None, None)
         self.config(cursor='')
+
+    def _on_space_key(self, event):
+        """Handle spacebar - ALWAYS trigger play/pause, nothing else."""
+        if self.on_play_pause:
+            self.on_play_pause()
+        return "break"  # Prevent any other action
 
     def _on_delete_key(self, event):
         """Delete the currently selected clip."""
@@ -293,7 +313,13 @@ class TimelineCanvas(tk.Canvas):
         # Clip selection / drag begin / slice
         hit = self._hit_test_clip(event.x, event.y)
         if hit:
-            hit_track_idx, hit_clip, hit_part = hit
+            # Handle envelope hits (4-element tuple) vs regular hits (3-element tuple)
+            if len(hit) == 4:
+                hit_track_idx, hit_clip, hit_part, hit_extra = hit
+            else:
+                hit_track_idx, hit_clip, hit_part = hit
+                hit_extra = None
+
             if hit_clip.get('loading'):
                 return
 
@@ -303,6 +329,33 @@ class TimelineCanvas(tk.Canvas):
 
             # Save state for undo before potential drag operation
             self.save_undo_state()
+
+            # Handle envelope line click - create new breakpoint
+            if hit_part == 'envelope_line':
+                self._create_envelope_point(hit_clip, hit_extra, event.x, event.y, hit_track_idx)
+                return
+
+            # Handle envelope point drag
+            if hit_part == 'envelope_point':
+                point_idx = hit_extra
+                envelope = hit_clip.get('volume_envelope', [])
+                if 0 <= point_idx < len(envelope):
+                    point = envelope[point_idx]
+                    self._drag_state = {
+                        'mode': 'envelope_point',
+                        'track_idx': hit_track_idx,
+                        'clip': hit_clip,
+                        'point_idx': point_idx,
+                        'original_time': float(point.get('time', 0.0)),
+                        'original_volume': float(point.get('volume', 1.0)),
+                        'mouse_x': event.x,
+                        'mouse_y': event.y,
+                        'click_x': event.x,
+                        'click_y': event.y,
+                        'has_dragged': True,  # Allow immediate dragging for envelope points
+                    }
+                    self._draw()
+                return
 
             start_time = float(hit_clip.get('start', 0.0))
             duration = float(hit_clip.get('duration', 0.0))
@@ -355,6 +408,18 @@ class TimelineCanvas(tk.Canvas):
             self._drag_playhead = True
 
     def _on_double_click(self, event):
+        # Check if double-click is on an envelope point - delete it
+        hit = self._hit_test_clip(event.x, event.y)
+        if hit and len(hit) == 4:
+            hit_track_idx, hit_clip, hit_part, hit_extra = hit
+            if hit_part == 'envelope_point':
+                point_idx = hit_extra
+                # Save state for undo
+                self.save_undo_state()
+                # Delete the point (won't delete first/last)
+                if self._delete_envelope_point(hit_clip, point_idx):
+                    return
+
         resize_idx = self._hit_test_track_resize(event.x, event.y)
         if resize_idx is None:
             return
@@ -473,20 +538,62 @@ class TimelineCanvas(tk.Canvas):
         self._draw()
         self._notify_scroll_update()
 
+    def _adjust_envelope_zoom(self, delta: int):
+        """Adjust vertical zoom for the volume envelope line (Ctrl+Shift+Wheel)."""
+        try:
+            zoom = float(self._envelope_zoom)
+        except Exception:
+            zoom = 1.0
+
+        step = float(getattr(self, '_envelope_zoom_step', 1.15) or 1.15)
+        if delta > 0:
+            zoom *= step
+        else:
+            zoom /= step
+
+        zoom = max(float(self._min_envelope_zoom), min(float(self._max_envelope_zoom), float(zoom)))
+        if abs(zoom - float(self._envelope_zoom)) > 1e-6:
+            self._envelope_zoom = zoom
+            self._draw()
+
     def _on_mousewheel(self, event):
-        """Handle mouse wheel zoom (Windows/macOS)."""
+        """Handle mouse wheel zoom (Windows/macOS).
+
+        - Wheel: timeline zoom
+        - Ctrl+Shift+Wheel: envelope zoom
+        """
+        # Tk state bitmask: Shift=0x0001, Control=0x0004
+        ctrl = bool(getattr(event, 'state', 0) & 0x0004)
+        shift = bool(getattr(event, 'state', 0) & 0x0001)
+
+        delta = 1 if event.delta > 0 else -1
+
+        if ctrl and shift:
+            self._adjust_envelope_zoom(delta)
+            return "break"
+
         if self.on_zoom_request:
-            # event.delta is positive for scroll up (zoom in), negative for scroll down (zoom out)
-            # On Windows, delta is typically 120 per notch
-            delta = 1 if event.delta > 0 else -1
             self.on_zoom_request(delta)
+        return "break"
 
     def _on_mousewheel_linux(self, event):
-        """Handle mouse wheel zoom (Linux)."""
+        """Handle mouse wheel zoom (Linux).
+
+        - Wheel: timeline zoom
+        - Ctrl+Shift+Wheel: envelope zoom
+        """
+        ctrl = bool(getattr(event, 'state', 0) & 0x0004)
+        shift = bool(getattr(event, 'state', 0) & 0x0001)
+
+        delta = 1 if event.num == 4 else -1
+
+        if ctrl and shift:
+            self._adjust_envelope_zoom(delta)
+            return "break"
+
         if self.on_zoom_request:
-            # Button-4 is scroll up (zoom in), Button-5 is scroll down (zoom out)
-            delta = 1 if event.num == 4 else -1
             self.on_zoom_request(delta)
+        return "break"
 
     def _on_right_click(self, event):
         """Handle right-click for context menu in track labels panel."""
@@ -589,8 +696,33 @@ class TimelineCanvas(tk.Canvas):
         old_slice_info = self._slice_hover_info
         self._slice_hover_info = None
 
+        # Track envelope point hover state
+        old_envelope_point = self._hovered_envelope_point
+        self._hovered_envelope_point = None
+
         if hit:
-            track_idx, clip, part = hit
+            # Handle 4-tuple (envelope) vs 3-tuple (other)
+            if len(hit) == 4:
+                track_idx, clip, part, extra = hit
+            else:
+                track_idx, clip, part = hit
+                extra = None
+
+            # Handle envelope point hover
+            if part == 'envelope_point':
+                self._hovered_envelope_point = {'clip': clip, 'point_idx': extra}
+                cursor = 'hand2'
+                if old_envelope_point != self._hovered_envelope_point:
+                    self._draw()
+                self.config(cursor=cursor)
+                return
+
+            # Handle envelope line hover
+            if part == 'envelope_line':
+                cursor = 'crosshair'  # Indicate you can click to add point
+                self.config(cursor=cursor)
+                return
+
             if part in ('trim_start', 'trim_end', 'fade_in', 'fade_out'):
                 cursor = 'sb_h_double_arrow'
             elif part in ('fade_in_curve', 'fade_out_curve'):
@@ -808,12 +940,366 @@ class TimelineCanvas(tk.Canvas):
                                     if ((x - mid_x) * (x - mid_x) + (y - mid_y) * (y - mid_y)) <= curve_r2:
                                         return (track_idx, clip, 'fade_out_curve')
 
+                        # Check envelope points and line (only for audio tracks)
+                        if track.get('type', 'audio') == 'audio':
+                            envelope_hit = self._hit_test_envelope(clip, x, y, x1, x2, y1, y2, track_idx)
+                            if envelope_hit:
+                                return envelope_hit
+
                     if (x - x1) <= self._clip_edge_px and (x2 - x1) >= (self._clip_edge_px * 2):
                         return (track_idx, clip, 'trim_start')
                     if (x2 - x) <= self._clip_edge_px and (x2 - x1) >= (self._clip_edge_px * 2):
                         return (track_idx, clip, 'trim_end')
                     return (track_idx, clip, 'move')
         return None
+
+    def _hit_test_envelope(self, clip, mx: int, my: int, clip_x1: int, clip_x2: int,
+                           clip_y1: int, clip_y2: int, track_idx: int) -> Optional[tuple]:
+        """Test if mouse is over an envelope point or line segment.
+
+        Returns (track_idx, clip, 'envelope_point', point_idx) for point hits,
+        or (track_idx, clip, 'envelope_line', time) for line hits.
+        """
+        envelope = clip.get('volume_envelope')
+        if not envelope or len(envelope) < 2:
+            return None
+
+        clip_duration = float(clip.get('duration', 0.0))
+        if clip_duration <= 0:
+            return None
+
+        # Calculate envelope Y range (same as in _draw_volume_envelope)
+        envelope_top = clip_y1 + 20
+        envelope_bottom = clip_y2 - 8
+        envelope_height = envelope_bottom - envelope_top
+        if envelope_height < 10:
+            return None
+
+        start_x = clip_x1  # This is already the screen x of clip start
+        r = self._envelope_point_radius
+        r2 = r * r
+
+        # First check if mouse is near any point
+        for i, point in enumerate(envelope):
+            time = float(point.get('time', 0.0))
+            volume = float(point.get('volume', 1.0))
+            volume = max(0.0, min(1.0, volume))
+
+            px = start_x + int(round(time * self.pixels_per_second))
+            py = int(round(self._envelope_volume_to_y(volume, envelope_top, envelope_bottom)))
+
+            dist_sq = (mx - px) * (mx - px) + (my - py) * (my - py)
+            if dist_sq <= r2 * 2.5:  # Slightly larger hit area
+                return (track_idx, clip, 'envelope_point', i)
+
+        # Then check if mouse is near a line segment
+        tolerance = self._envelope_line_hit_tolerance
+        for i in range(len(envelope) - 1):
+            p1 = envelope[i]
+            p2 = envelope[i + 1]
+
+            t1 = float(p1.get('time', 0.0))
+            v1 = float(p1.get('volume', 1.0))
+            t2 = float(p2.get('time', 0.0))
+            v2 = float(p2.get('volume', 1.0))
+
+            x1 = start_x + int(round(t1 * self.pixels_per_second))
+            y1 = int(round(self._envelope_volume_to_y(v1, envelope_top, envelope_bottom)))
+            x2 = start_x + int(round(t2 * self.pixels_per_second))
+            y2 = int(round(self._envelope_volume_to_y(v2, envelope_top, envelope_bottom)))
+
+            # Check if mx is within the x range of this segment
+            if not (min(x1, x2) - tolerance <= mx <= max(x1, x2) + tolerance):
+                continue
+
+            # Calculate distance from point to line segment
+            dist = self._point_to_segment_distance(mx, my, x1, y1, x2, y2)
+            if dist <= tolerance:
+                # Calculate the time at this x position
+                if x2 != x1:
+                    t = (mx - x1) / (x2 - x1)
+                    t = max(0.0, min(1.0, t))
+                    hit_time = t1 + t * (t2 - t1)
+                else:
+                    hit_time = t1
+                return (track_idx, clip, 'envelope_line', hit_time)
+
+        return None
+
+    def _point_to_segment_distance(self, px: int, py: int, x1: int, y1: int, x2: int, y2: int) -> float:
+        """Calculate distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+
+        if length_sq == 0:
+            # Segment is a point
+            return math.sqrt((px - x1) ** 2 + (py - y1) ** 2)
+
+        # Project point onto line
+        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+
+        return math.sqrt((px - proj_x) ** 2 + (py - proj_y) ** 2)
+
+    def _create_envelope_point(self, clip: dict, time: float, mouse_x: int, mouse_y: int, track_idx: int):
+        """Create a new envelope breakpoint at the given time."""
+        envelope = clip.get('volume_envelope')
+        if not envelope:
+            return
+
+        clip_duration = float(clip.get('duration', 0.0))
+        if clip_duration <= 0:
+            return
+
+        # Clamp time to valid range
+        time = max(0.0, min(time, clip_duration))
+
+        # Calculate the volume at this time by interpolating between existing points
+        volume = self._get_envelope_volume_at_time(envelope, time)
+
+        # Find the right position to insert (keep sorted by time)
+        insert_idx = 0
+        for i, point in enumerate(envelope):
+            if float(point.get('time', 0.0)) < time:
+                insert_idx = i + 1
+            else:
+                break
+
+        # Create new point
+        new_point = {'time': time, 'volume': volume}
+        envelope.insert(insert_idx, new_point)
+
+        # Start dragging the new point
+        self._drag_state = {
+            'mode': 'envelope_point',
+            'track_idx': track_idx,
+            'clip': clip,
+            'point_idx': insert_idx,
+            'original_time': time,
+            'original_volume': volume,
+            'mouse_x': mouse_x,
+            'mouse_y': mouse_y,
+            'click_x': mouse_x,
+            'click_y': mouse_y,
+            'has_dragged': True,  # Allow immediate dragging
+        }
+
+        self._draw()
+        if self.on_timeline_edited:
+            self.on_timeline_edited()
+
+    def _get_envelope_volume_at_time(self, envelope: list, time: float) -> float:
+        """Get the interpolated volume at a given time in the envelope."""
+        if not envelope:
+            return 1.0
+
+        # Find surrounding points
+        prev_point = None
+        next_point = None
+
+        for point in envelope:
+            pt = float(point.get('time', 0.0))
+            if pt <= time:
+                prev_point = point
+            else:
+                next_point = point
+                break
+
+        if prev_point is None:
+            return float(envelope[0].get('volume', 1.0))
+        if next_point is None:
+            return float(prev_point.get('volume', 1.0))
+
+        # Linear interpolation
+        t1 = float(prev_point.get('time', 0.0))
+        v1 = float(prev_point.get('volume', 1.0))
+        t2 = float(next_point.get('time', 0.0))
+        v2 = float(next_point.get('volume', 1.0))
+
+        if t2 == t1:
+            return v1
+
+        t = (time - t1) / (t2 - t1)
+        return v1 + t * (v2 - v1)
+
+    def _envelope_volume_to_y(self, volume: float, envelope_top: float, envelope_bottom: float) -> float:
+        """Map a 0..1 volume value to a Y coordinate, accounting for envelope zoom."""
+        height = max(1.0, float(envelope_bottom) - float(envelope_top))
+        v = max(0.0, min(1.0, float(volume)))
+
+        zoom = float(getattr(self, '_envelope_zoom', 1.0) or 1.0)
+        if zoom > 1.0:
+            display_min = max(0.0, 1.0 - (1.0 / zoom))
+            denom = 1.0 - display_min
+            if denom > 1e-9:
+                v = (v - display_min) / denom
+            else:
+                v = 1.0
+            v = max(0.0, min(1.0, v))
+
+        return float(envelope_bottom) - (v * height)
+
+    def _envelope_y_to_volume(self, y: float, envelope_top: float, envelope_bottom: float) -> float:
+        """Map a Y coordinate back to a 0..1 volume value, accounting for envelope zoom."""
+        height = max(1.0, float(envelope_bottom) - float(envelope_top))
+        yy = max(float(envelope_top), min(float(envelope_bottom), float(y)))
+        v_norm = (float(envelope_bottom) - yy) / height
+        v_norm = max(0.0, min(1.0, v_norm))
+
+        zoom = float(getattr(self, '_envelope_zoom', 1.0) or 1.0)
+        if zoom > 1.0:
+            display_min = max(0.0, 1.0 - (1.0 / zoom))
+            v = display_min + (v_norm * (1.0 - display_min))
+        else:
+            v = v_norm
+
+        return max(0.0, min(1.0, float(v)))
+
+    def _delete_envelope_point(self, clip: dict, point_idx: int):
+        """Delete an envelope breakpoint (but not the first or last point)."""
+        envelope = clip.get('volume_envelope')
+        if not envelope or len(envelope) <= 2:
+            return False
+
+        # Don't delete first or last point
+        if point_idx <= 0 or point_idx >= len(envelope) - 1:
+            return False
+
+        envelope.pop(point_idx)
+        self._draw()
+        if self.on_timeline_edited:
+            self.on_timeline_edited()
+        return True
+
+    def _adjust_envelope_for_trim(self, clip: dict, old_duration: float, new_duration: float,
+                                   time_shift: float = 0.0):
+        """Adjust volume envelope when clip is trimmed or expanded.
+
+        Args:
+            clip: The clip being modified
+            old_duration: Duration before the change
+            new_duration: Duration after the change
+            time_shift: How much to shift envelope times (positive = expand start, negative = trim start)
+                       For trim_end/expand_end, this should be 0.
+        """
+        envelope = clip.get('volume_envelope')
+        if not envelope or len(envelope) < 2:
+            # Create default envelope if none exists
+            clip['volume_envelope'] = [
+                {'time': 0.0, 'volume': 1.0},
+                {'time': new_duration, 'volume': 1.0}
+            ]
+            return
+
+        # Get the volume at the old boundaries (for extending)
+        old_first_volume = float(envelope[0].get('volume', 1.0))
+        old_last_volume = float(envelope[-1].get('volume', 1.0))
+
+        is_expanding = new_duration > old_duration
+        is_expanding_start = time_shift > 0.001
+        is_trimming_start = time_shift < -0.001
+
+        # Apply time shift to all points (for trim_start/expand_start)
+        if abs(time_shift) > 0.001:
+            for point in envelope:
+                point['time'] = float(point.get('time', 0.0)) + time_shift
+
+        new_envelope = []
+
+        if is_expanding_start:
+            # EXPAND START: Add new first point at 0 with old first volume, keep rest as-is
+            new_envelope.append({'time': 0.0, 'volume': old_first_volume})
+            for point in envelope:
+                t = float(point.get('time', 0.0))
+                v = float(point.get('volume', 1.0))
+                if t > 0.001:  # Skip if too close to 0 (we already added that)
+                    new_envelope.append({'time': t, 'volume': v})
+            # Update last point to new duration
+            if new_envelope:
+                new_envelope[-1]['time'] = new_duration
+
+        elif is_trimming_start:
+            # TRIM START: Remove points < 0, add interpolated point at 0 if needed
+            first_valid_idx = -1
+            for i, point in enumerate(envelope):
+                t = float(point.get('time', 0.0))
+                if t >= 0:
+                    first_valid_idx = i
+                    break
+
+            if first_valid_idx == -1:
+                # All points are before 0, create default
+                new_envelope = [
+                    {'time': 0.0, 'volume': old_first_volume},
+                    {'time': new_duration, 'volume': old_last_volume}
+                ]
+            else:
+                # Check if we need interpolated point at 0
+                first_valid_time = float(envelope[first_valid_idx].get('time', 0.0))
+                if first_valid_time > 0.001:
+                    # Need interpolated point at 0
+                    vol_at_zero = self._get_envelope_volume_at_time(envelope, 0.0)
+                    new_envelope.append({'time': 0.0, 'volume': vol_at_zero})
+
+                # Add all valid points
+                for i in range(first_valid_idx, len(envelope)):
+                    point = envelope[i]
+                    t = float(point.get('time', 0.0))
+                    v = float(point.get('volume', 1.0))
+                    if t <= new_duration:
+                        if not new_envelope or abs(new_envelope[-1]['time'] - t) > 0.001:
+                            new_envelope.append({'time': t, 'volume': v})
+
+                # Ensure last point is at new_duration
+                if new_envelope and abs(new_envelope[-1]['time'] - new_duration) > 0.001:
+                    vol_at_end = self._get_envelope_volume_at_time(envelope, new_duration)
+                    new_envelope.append({'time': new_duration, 'volume': vol_at_end})
+
+        elif is_expanding:
+            # EXPAND END: Keep all points, add new last point with old last volume
+            for point in envelope:
+                t = float(point.get('time', 0.0))
+                v = float(point.get('volume', 1.0))
+                new_envelope.append({'time': t, 'volume': v})
+            # Add new last point at new_duration with same volume as old last
+            new_envelope.append({'time': new_duration, 'volume': old_last_volume})
+
+        else:
+            # TRIM END: Remove points > new_duration, add interpolated point at new_duration
+            for point in envelope:
+                t = float(point.get('time', 0.0))
+                v = float(point.get('volume', 1.0))
+                if t < new_duration - 0.001:
+                    new_envelope.append({'time': t, 'volume': v})
+                elif abs(t - new_duration) < 0.001:
+                    new_envelope.append({'time': new_duration, 'volume': v})
+                    break
+
+            # Ensure last point is at new_duration
+            if new_envelope:
+                last_time = float(new_envelope[-1].get('time', 0.0))
+                if last_time < new_duration - 0.001:
+                    vol_at_end = self._get_envelope_volume_at_time(envelope, new_duration)
+                    new_envelope.append({'time': new_duration, 'volume': vol_at_end})
+
+        # Ensure we have at least 2 points
+        if len(new_envelope) < 2:
+            new_envelope = [
+                {'time': 0.0, 'volume': old_first_volume},
+                {'time': new_duration, 'volume': old_last_volume}
+            ]
+
+        # Ensure first point is at 0
+        if new_envelope and float(new_envelope[0].get('time', 0.0)) > 0.001:
+            new_envelope.insert(0, {'time': 0.0, 'volume': float(new_envelope[0].get('volume', 1.0))})
+
+        # Ensure last point is at new_duration
+        if new_envelope and abs(float(new_envelope[-1].get('time', 0.0)) - new_duration) > 0.001:
+            new_envelope.append({'time': new_duration, 'volume': float(new_envelope[-1].get('volume', 1.0))})
+
+        clip['volume_envelope'] = new_envelope
 
     def _apply_drag(self, x: int, y: int):
         state = self._drag_state
@@ -905,6 +1391,53 @@ class TimelineCanvas(tk.Canvas):
 
             clip['start'] = new_start
 
+        elif mode == 'envelope_point':
+            # Drag envelope point
+            point_idx = state.get('point_idx')
+            envelope = clip.get('volume_envelope', [])
+            if point_idx is None or point_idx < 0 or point_idx >= len(envelope):
+                return
+
+            point = envelope[point_idx]
+            clip_duration = float(clip.get('duration', 0.0))
+
+            # Get clip rect to calculate envelope bounds
+            bounds = self._track_bounds(track_idx)
+            if not bounds:
+                return
+            track_y1, track_y2 = bounds
+            padding = 4
+            clip_y1 = track_y1 + padding
+            clip_y2 = track_y2 - padding
+
+            envelope_top = clip_y1 + 20
+            envelope_bottom = clip_y2 - 8
+
+            # Calculate clip start x
+            clip_start_x = self._content_start_x + float(clip.get('start', 0.0)) * self.pixels_per_second - self.scroll_offset
+
+            # Calculate new time from x position
+            new_time = (float(x) - clip_start_x) / self.pixels_per_second
+
+            # Calculate new volume from y position
+            new_volume = self._envelope_y_to_volume(float(y), envelope_top, envelope_bottom)
+
+            # First and last points can only move vertically (time is locked)
+            if point_idx == 0:
+                new_time = 0.0
+            elif point_idx == len(envelope) - 1:
+                new_time = clip_duration
+            else:
+                # Clamp time to be between adjacent points
+                prev_time = float(envelope[point_idx - 1].get('time', 0.0)) + 0.01
+                next_time = float(envelope[point_idx + 1].get('time', clip_duration)) - 0.01
+                new_time = max(prev_time, min(new_time, next_time))
+
+            point['time'] = new_time
+            point['volume'] = new_volume
+            self._draw()
+            return
+
         elif mode == 'trim_start':
             original_start = float(state['start_time'])
             original_duration = float(state['duration'])
@@ -933,9 +1466,15 @@ class TimelineCanvas(tk.Canvas):
             clip['fade_in'] = max(0.0, min(float(clip.get('fade_in', 0.0)), float(clip['duration'])))
             clip['fade_out'] = max(0.0, min(float(clip.get('fade_out', 0.0)), float(clip['duration'])))
 
+            # Adjust envelope for trim_start
+            # time_shift is negative when trimming (removing beginning), positive when expanding
+            time_shift = new_duration - original_duration
+            self._adjust_envelope_for_trim(clip, original_duration, new_duration, time_shift)
+
         elif mode == 'trim_end':
             original_start = float(state['start_time'])
             original_source_start = float(state['source_start'])
+            original_duration = float(state['duration'])
 
             proposed_end = (float(x) - self._content_start_x + self.scroll_offset) / self.pixels_per_second
             proposed_end = max(original_start + self._min_clip_duration, proposed_end)
@@ -949,6 +1488,9 @@ class TimelineCanvas(tk.Canvas):
             clip['duration'] = max(self._min_clip_duration, new_duration)
             clip['fade_in'] = max(0.0, min(float(clip.get('fade_in', 0.0)), float(clip['duration'])))
             clip['fade_out'] = max(0.0, min(float(clip.get('fade_out', 0.0)), float(clip['duration'])))
+
+            # Adjust envelope for trim_end (no time shift, just duration change)
+            self._adjust_envelope_for_trim(clip, original_duration, clip['duration'], 0.0)
 
         elif mode == 'fade_in':
             clip_start = float(clip.get('start', 0.0))
@@ -1070,6 +1612,58 @@ class TimelineCanvas(tk.Canvas):
             if key in clip:
                 left_clip[key] = clip[key]
                 right_clip[key] = clip[key]
+
+        # Split the volume envelope
+        original_envelope = clip.get('volume_envelope')
+        if original_envelope and len(original_envelope) >= 2:
+            # Slice time relative to clip start
+            slice_offset = slice_time - clip_start
+
+            # Create left envelope (0 to slice_offset)
+            left_envelope = []
+            for point in original_envelope:
+                t = float(point.get('time', 0.0))
+                v = float(point.get('volume', 1.0))
+                if t <= slice_offset:
+                    left_envelope.append({'time': t, 'volume': v})
+
+            # Add interpolated point at slice_offset if needed
+            if not left_envelope or float(left_envelope[-1].get('time', 0.0)) < slice_offset - 0.001:
+                vol_at_slice = self._get_envelope_volume_at_time(original_envelope, slice_offset)
+                left_envelope.append({'time': slice_offset, 'volume': vol_at_slice})
+
+            # Ensure left envelope starts at 0
+            if not left_envelope or float(left_envelope[0].get('time', 0.0)) > 0.001:
+                left_envelope.insert(0, {'time': 0.0, 'volume': float(original_envelope[0].get('volume', 1.0))})
+
+            # Adjust left envelope duration to match left_duration
+            if left_envelope:
+                left_envelope[-1]['time'] = left_duration
+
+            left_clip['volume_envelope'] = left_envelope
+
+            # Create right envelope (slice_offset to end, shifted to start at 0)
+            right_envelope = []
+
+            # Add point at 0 with interpolated volume at slice point
+            vol_at_slice = self._get_envelope_volume_at_time(original_envelope, slice_offset)
+            right_envelope.append({'time': 0.0, 'volume': vol_at_slice})
+
+            # Add points after slice_offset, shifted
+            for point in original_envelope:
+                t = float(point.get('time', 0.0))
+                v = float(point.get('volume', 1.0))
+                if t > slice_offset:
+                    new_t = t - slice_offset
+                    if new_t <= right_duration:
+                        right_envelope.append({'time': new_t, 'volume': v})
+
+            # Ensure right envelope ends at right_duration
+            if not right_envelope or float(right_envelope[-1].get('time', 0.0)) < right_duration - 0.001:
+                vol_at_end = float(original_envelope[-1].get('volume', 1.0))
+                right_envelope.append({'time': right_duration, 'volume': vol_at_end})
+
+            right_clip['volume_envelope'] = right_envelope
 
         # Remove original clip and add the two new clips
         clips.remove(clip)
@@ -1521,10 +2115,26 @@ class TimelineCanvas(tk.Canvas):
                             points.extend([x, y_pt])
                         if len(points) >= 4:
                             # Draw shadow for depth
-                            shadow_points = [p + 1 if i % 2 == 1 else p for i, p in enumerate(points)]
-                            self.create_line(shadow_points, fill='#000000', width=3, smooth=True, splinesteps=36)
+                            shadow_points = [p + 1 for p in points]
+                            self.create_line(
+                                shadow_points,
+                                fill='#000000',
+                                width=3,
+                                smooth=True,
+                                splinesteps=36,
+                                capstyle=tk.ROUND,
+                                joinstyle=tk.ROUND,
+                            )
                             # Main curve with thicker stroke and high spline smoothness
-                            self.create_line(points, fill=Theme.PLAYHEAD, width=2, smooth=True, splinesteps=36)
+                            self.create_line(
+                                points,
+                                fill=Theme.PLAYHEAD,
+                                width=2,
+                                smooth=True,
+                                splinesteps=36,
+                                capstyle=tk.ROUND,
+                                joinstyle=tk.ROUND,
+                            )
 
                     if is_selected and fade_px >= (curve_r * 4):
                         mid_x = start_x + (fade_px / 2)
@@ -1575,10 +2185,26 @@ class TimelineCanvas(tk.Canvas):
                             points.extend([x, y_pt])
                         if len(points) >= 4:
                             # Draw shadow for depth
-                            shadow_points = [p + 1 if i % 2 == 1 else p for i, p in enumerate(points)]
-                            self.create_line(shadow_points, fill='#000000', width=3, smooth=True, splinesteps=36)
+                            shadow_points = [p + 1 for p in points]
+                            self.create_line(
+                                shadow_points,
+                                fill='#000000',
+                                width=3,
+                                smooth=True,
+                                splinesteps=36,
+                                capstyle=tk.ROUND,
+                                joinstyle=tk.ROUND,
+                            )
                             # Main curve with thicker stroke and high spline smoothness
-                            self.create_line(points, fill=Theme.PLAYHEAD, width=2, smooth=True, splinesteps=36)
+                            self.create_line(
+                                points,
+                                fill=Theme.PLAYHEAD,
+                                width=2,
+                                smooth=True,
+                                splinesteps=36,
+                                capstyle=tk.ROUND,
+                                joinstyle=tk.ROUND,
+                            )
 
                     if is_selected and fade_px >= (curve_r * 4):
                         mid_x = fade_out_x + (fade_px / 2)
@@ -1656,6 +2282,144 @@ class TimelineCanvas(tk.Canvas):
                 slice_x, clip_y2 - 2 - tri_size,
                 fill='#ff6b6b', outline='', tags=('slice_indicator',)
             )
+
+        # Draw volume envelope (only for audio tracks, not video)
+        if not is_loading and track.get('type', 'audio') == 'audio':
+            self._draw_volume_envelope(clip, start_x, end_x, clip_y1, clip_y2, draw_left, draw_right)
+
+    def _draw_volume_envelope(self, clip, start_x, end_x, clip_y1, clip_y2, draw_left, draw_right):
+        """Draw the volume envelope line and breakpoints on a clip."""
+        clip_duration = float(clip.get('duration', 0.0))
+        if clip_duration <= 0:
+            return
+
+        # Get or initialize volume envelope
+        envelope = clip.get('volume_envelope')
+        if envelope is None:
+            # Default: flat line at 100% volume (just start and end points)
+            envelope = [
+                {'time': 0.0, 'volume': 1.0},
+                {'time': clip_duration, 'volume': 1.0}
+            ]
+            clip['volume_envelope'] = envelope
+
+        # Ensure envelope has at least 2 points
+        if len(envelope) < 2:
+            envelope = [
+                {'time': 0.0, 'volume': 1.0},
+                {'time': clip_duration, 'volume': 1.0}
+            ]
+            clip['volume_envelope'] = envelope
+
+        # Calculate Y range for envelope (leave some padding at top/bottom)
+        envelope_top = clip_y1 + 20  # Leave space for clip name
+        envelope_bottom = clip_y2 - 8
+        envelope_height = envelope_bottom - envelope_top
+        if envelope_height < 10:
+            return
+
+        # Build line points only for the visible clip region.
+        # Important: never draw into the left track header area when the clip starts off-screen.
+        pps = max(1.0, float(self.pixels_per_second))
+
+        visible_t0 = (float(draw_left) - float(start_x)) / pps
+        visible_t1 = (float(draw_right) - float(start_x)) / pps
+        t0 = max(0.0, min(clip_duration, float(visible_t0)))
+        t1 = max(0.0, min(clip_duration, float(visible_t1)))
+        if t1 <= t0:
+            return
+
+        points_tv: list[tuple[float, float]] = []
+        points_tv.append((t0, float(self._get_envelope_volume_at_time(envelope, t0))))
+        for point in envelope:
+            time = float(point.get('time', 0.0))
+            if t0 < time < t1:
+                points_tv.append((time, float(point.get('volume', 1.0))))
+        points_tv.append((t1, float(self._get_envelope_volume_at_time(envelope, t1))))
+
+        cleaned: list[tuple[float, float]] = []
+        for time, volume in points_tv:
+            if cleaned and abs(time - cleaned[-1][0]) < 1e-6:
+                cleaned[-1] = (time, volume)
+            else:
+                cleaned.append((time, volume))
+
+        line_points: list[float] = []
+        for time, volume in cleaned:
+            x = float(start_x) + (float(time) * pps)
+            if x < float(draw_left):
+                x = float(draw_left)
+            elif x > float(draw_right):
+                x = float(draw_right)
+            y = self._envelope_volume_to_y(float(volume), envelope_top, envelope_bottom)
+            line_points.extend([x, y])
+
+        point_positions = []  # (x, y, idx, point) for drawing handles
+        for idx, point in enumerate(envelope):
+            time = float(point.get('time', 0.0))
+            x = float(start_x) + (time * pps)
+            if x < float(draw_left) or x > float(draw_right):
+                continue
+            y = self._envelope_volume_to_y(float(point.get('volume', 1.0)), envelope_top, envelope_bottom)
+            point_positions.append((x, y, idx, point))
+
+        # Draw the envelope line
+        if len(line_points) >= 4:
+            shadow_points = [p + 1 for p in line_points]
+            self.create_line(
+                shadow_points,
+                fill='#000000',
+                width=3,
+                capstyle=tk.ROUND,
+                joinstyle=tk.ROUND,
+                tags=('envelope_line',),
+            )
+            self.create_line(
+                line_points,
+                fill='#ffd700',
+                width=2,
+                capstyle=tk.ROUND,
+                joinstyle=tk.ROUND,
+                tags=('envelope_line',),
+            )
+
+        # Draw breakpoints (circles)
+        r = self._envelope_point_radius
+        for x, y, idx, point in point_positions:
+            if x < draw_left - r or x > draw_right + r:
+                continue
+
+            # Check if this point is hovered
+            is_hovered = (
+                self._hovered_envelope_point is not None
+                and self._hovered_envelope_point.get('clip') is clip
+                and self._hovered_envelope_point.get('point_idx') == idx
+            )
+
+            # Check if this point is being dragged
+            is_dragging = (
+                self._drag_state is not None
+                and self._drag_state.get('mode') == 'envelope_point'
+                and self._drag_state.get('clip') is clip
+                and self._drag_state.get('point_idx') == idx
+            )
+
+            if is_hovered or is_dragging:
+                # Highlight effect
+                self.create_oval(x - r - 3, y - r - 3, x + r + 3, y + r + 3,
+                               fill='', outline='#ffff00', width=2, tags=('envelope_point',))
+
+            # Point fill color
+            if is_dragging:
+                fill_color = '#ff6600'  # Orange when dragging
+            elif is_hovered:
+                fill_color = '#ffff00'  # Bright yellow when hovered
+            else:
+                fill_color = '#ffd700'  # Gold normally
+
+            # Draw the point
+            self.create_oval(x - r, y - r, x + r, y + r,
+                           fill=fill_color, outline='#000000', width=1, tags=('envelope_point',))
 
     def _draw_waveform(self, clip, track, start_x, clip_y, clip_width, clip_height):
         """Draw simplified waveform inside clip."""
@@ -1895,6 +2659,9 @@ class TimelineCanvas(tk.Canvas):
                 # Include frame_rate if present
                 if 'frame_rate' in clip:
                     clip_data['frame_rate'] = clip['frame_rate']
+                # Include volume envelope if present
+                if 'volume_envelope' in clip:
+                    clip_data['volume_envelope'] = clip['volume_envelope']
                 track_data['clips'].append(clip_data)
 
             tracks_data.append(track_data)
@@ -1981,6 +2748,9 @@ class TimelineCanvas(tk.Canvas):
                 }
                 if 'frame_rate' in clip_data:
                     clip['frame_rate'] = clip_data['frame_rate']
+                # Load volume envelope if present
+                if 'volume_envelope' in clip_data:
+                    clip['volume_envelope'] = clip_data['volume_envelope']
 
                 track['clips'].append(clip)
 
