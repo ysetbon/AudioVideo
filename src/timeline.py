@@ -527,6 +527,36 @@ class TimelineCanvas(tk.Canvas):
                         self.on_timeline_edited()
                     return
 
+        # Handle overlap trimming when a clip is moved and overlaps another clip
+        if self._drag_state.get('mode') == 'move' and self._drag_state.get('has_dragged'):
+            clip = self._drag_state.get('clip')
+            track_idx = self._drag_state.get('track_idx')
+            if clip and track_idx is not None:
+                track = self.tracks[track_idx]
+                moved_start = float(clip.get('start', 0.0))
+                moved_end = moved_start + float(clip.get('duration', 0.0))
+
+                # Check all other clips in the same track for overlap
+                for other in track.get('clips', []):
+                    if other is clip:
+                        continue
+                    other_start = float(other.get('start', 0.0))
+                    other_end = other_start + float(other.get('duration', 0.0))
+
+                    # Check if moved clip overlaps with other clip
+                    if moved_start < other_end and moved_end > other_start:
+                        # Moved clip overlaps with other clip
+                        # Trim the other clip's end to match moved clip's start
+                        if other_start < moved_start < other_end:
+                            # Other clip extends into the moved clip from the left
+                            # Trim other clip's end to moved clip's start
+                            new_duration = moved_start - other_start
+                            if new_duration >= self._min_clip_duration:
+                                other['duration'] = new_duration
+                                # Adjust fade_out if it exceeds new duration
+                                other['fade_out'] = max(0.0, min(float(other.get('fade_out', 0.0)), new_duration))
+                                other['fade_in'] = max(0.0, min(float(other.get('fade_in', 0.0)), new_duration))
+
         self._drag_state = None
         self._sort_all_tracks()
         self._draw()
